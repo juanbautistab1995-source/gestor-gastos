@@ -39,7 +39,6 @@ def save(key, df):
     df.to_csv(f, index=False)
 
 def to_num(s):
-    # Fix robusto para leer números con formato
     return pd.to_numeric(
         pd.Series(s).astype(str).str.replace(r"[^\d\.\-]", "", regex=True),
         errors="coerce"
@@ -63,7 +62,7 @@ def emoji_cat(cat):
 
 def safe_int(val, default=1):
     try:
-        if val is None or str(val).strip() in ("", "nan", "None", "N/A"):
+        if pd.isna(val) or str(val).strip() in ("", "nan", "None", "N/A"):
             return default
         return int(float(str(val)))
     except (ValueError, TypeError):
@@ -134,8 +133,8 @@ def filtrar_gastos_tarjeta_periodo(gastos_df, tarjeta_nombre, año_periodo, mes_
             mask.append(False)
     return gastos_df[mask]
 
-# ── Página ─────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="💳 JuanB", layout="centered", initial_sidebar_state="collapsed")
+# ── Página Configuración ────────────────────────────────────────────────────────
+st.set_page_config(page_title="💳 JuanB Gestor", layout="centered", initial_sidebar_state="collapsed")
 
 st.markdown("""
 <style>
@@ -148,13 +147,14 @@ html, body, [class*="css"], .stApp {
 }
 
 #MainMenu, header, footer { visibility: hidden; }
-.block-container { padding: 0.8rem 0.8rem 5rem !important; max-width: 480px !important; margin: auto; }
+.block-container { padding: 1rem 0.8rem 5rem !important; max-width: 480px !important; margin: auto; }
 
-/* Tabs y Componentes Visuales */
+/* Menú principal de Tabs */
 [data-baseweb="tab-list"] { background: #1a1a24 !important; border-radius: 14px !important; padding: 4px !important; gap: 2px !important; border: 1px solid #2a2a38 !important; }
-[data-baseweb="tab"] { border-radius: 10px !important; font-size: 0.68rem !important; font-weight: 600 !important; padding: 6px 8px !important; color: #888 !important; }
+[data-baseweb="tab"] { border-radius: 10px !important; font-size: 0.72rem !important; font-weight: 600 !important; padding: 6px 8px !important; color: #888 !important; }
 [aria-selected="true"][data-baseweb="tab"] { background: #7c6af7 !important; color: #fff !important; }
 
+/* Tarjetas Visuales */
 .card { background: #1a1a24; border: 1px solid #2a2a38; border-radius: 16px; padding: 1rem 1.1rem; margin-bottom: 0.6rem; }
 .card-label { font-size: 0.72rem; font-weight: 600; color: #888; text-transform: uppercase; margin-bottom: 2px; }
 .card-value { font-size: 1.9rem; font-weight: 800; line-height: 1.1; }
@@ -166,30 +166,33 @@ html, body, [class*="css"], .stApp {
 
 .tarjeta-card { background: #1a1a24; border: 1px solid #2a2a38; border-radius: 14px; padding: 0.85rem 1rem; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.8rem; }
 .tarjeta-nombre { font-size: 0.88rem; font-weight: 700; color: #e8e8f0; }
-.tarjeta-meta { font-size: 0.72rem; color: #666; margin-top: 1px; }
 .tarjeta-monto { margin-left: auto; font-size: 1.05rem; font-weight: 800; text-align: right; }
 
+/* Listado de movimientos */
 .tx-row { display: flex; align-items: center; gap: 0.7rem; padding: 0.7rem 0; border-bottom: 1px solid #1e1e2c; }
 .tx-icon { width: 38px; height: 38px; background: #22223a; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 1.1rem; flex-shrink: 0; }
 .tx-concepto { font-size: 0.87rem; font-weight: 600; color: #e8e8f0; }
 .tx-meta { font-size: 0.72rem; color: #666; }
 .tx-monto { margin-left: auto; font-size: 0.95rem; font-weight: 700; text-align: right; }
 
-.fab-container { position: fixed; bottom: 1.5rem; right: 1.2rem; z-index: 9999; }
-.stButton > button { background: #7c6af7 !important; color: #fff !important; border: none !important; border-radius: 12px !important; font-weight: 700 !important; font-size: 0.9rem !important; padding: 0.6rem 1rem !important; width: 100% !important; transition: background 0.2s !important; }
-.stButton > button:hover { background: #6b59e6 !important; }
-
+/* Formularios e inputs */
 .stTextInput input, .stNumberInput input, .stDateInput input, .stSelectbox div[data-baseweb="select"] > div { background: #1e1e2c !important; border: 1px solid #2e2e44 !important; border-radius: 10px !important; color: #e8e8f0 !important; font-size: 0.9rem !important; }
 label[data-testid="stWidgetLabel"] p { font-size: 0.75rem !important; font-weight: 600 !important; color: #888 !important; text-transform: uppercase; }
+
+/* Botones principales de la UI */
+div[data-testid="stButton"] button {
+    border-radius: 12px !important;
+    font-weight: 700 !important;
+}
 
 .sec-title { font-size: 0.72rem; font-weight: 700; color: #666; text-transform: uppercase; letter-spacing: 0.1em; margin: 1.1rem 0 0.5rem; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── Session state ──────────────────────────────────────────────────────────────
-if "show_quick_add" not in st.session_state: st.session_state.show_quick_add = False
 if "gasto_limit" not in st.session_state: st.session_state.gasto_limit = 25
-if "show_add_tarjeta" not in st.session_state: st.session_state.show_add_tarjeta = False
+if "menu_accion" not in st.session_state: st.session_state.menu_accion = False
+if "tipo_accion" not in st.session_state: st.session_state.tipo_accion = "Gasto"
 
 # ── Cargar datos ───────────────────────────────────────────────────────────────
 gastos_df   = load("gastos")
@@ -199,6 +202,7 @@ inv_df      = load("inversiones")
 pres_df     = load("presupuesto")
 tarjetas_df = load("tarjetas")
 
+# Asegurar tipos numéricos para no tener errores de sumas
 for df_target, col in [(gastos_df, "Monto"), (gastos_df, "Cuanto recupero"), (ingresos_df, "Monto"), (comp_df, "Monto")]:
     df_target[col] = to_num(df_target[col])
 
@@ -215,30 +219,89 @@ remanente   = total_ing - total_gast + recupero
 
 TARJETAS = get_tarjetas_nombres()
 
-# ── Modal de carga rápida (Anotador) ──────────────────────────────────────────
-if st.session_state.show_quick_add:
-    st.markdown("<div style='background:#1a1a28;border:1px solid #7c6af740;border-radius:20px;padding:1.2rem 1rem 0.8rem;margin-bottom:1rem;'><div style='font-size:0.95rem;font-weight:700;color:#a78bfa;margin-bottom:0.8rem'>⚡ Gasto rápido / Nuevo</div></div>", unsafe_allow_html=True)
-    with st.form("f_quick", clear_on_submit=True):
-        q_concepto = st.text_input("Concepto")
-        q_monto    = st.number_input("Monto $", min_value=0.0, step=100.0)
-        c1, c2 = st.columns(2)
-        q_tarjeta  = c1.selectbox("Tarjeta", TARJETAS)
-        q_cat      = c2.selectbox("Categoría", CAT_GASTOS)
-        c3, c4 = st.columns(2)
-        q_fecha    = c3.date_input("Fecha", value=date.today())
-        q_cuotas   = c4.number_input("Cuotas", min_value=1, max_value=48, value=1)
+# ══════════════════════════════════════════════════════════════════════════════
+# MENÚ FLOTANTE DE ACCIÓN RÁPIDA (UX Optimizada)
+# ══════════════════════════════════════════════════════════════════════════════
+# En lugar de un botón CSS que se rompe, usamos un contenedor principal claro
+col_espacio, col_boton = st.columns([3, 1])
+with col_boton:
+    if st.button("➕ Acciones", use_container_width=True, type="primary"):
+        st.session_state.menu_accion = not st.session_state.menu_accion
 
-        c_ok, c_x = st.columns([3,1])
-        if c_ok.form_submit_button("💾 Guardar"):
-            if q_concepto.strip() and q_monto > 0:
-                nuevo = pd.DataFrame([[str(q_fecha), q_concepto.strip(), q_monto, q_tarjeta, q_cuotas, q_cat, "No", "", 0, ""]], columns=gastos_df.columns)
-                gastos_df = pd.concat([gastos_df, nuevo], ignore_index=True)
-                save("gastos", gastos_df)
-                st.session_state.show_quick_add = False
+if st.session_state.menu_accion:
+    st.markdown("<div style='background:#1a1a24; border: 1px solid #7c6af7; border-radius: 12px; padding: 1rem; margin-bottom: 1rem;'>", unsafe_allow_html=True)
+    
+    st.session_state.tipo_accion = st.radio("¿Qué querés agregar?", ["Gasto", "Ingreso", "Tarjeta"], horizontal=True, label_visibility="collapsed")
+    
+    # ── Formulario Gasto ──
+    if st.session_state.tipo_accion == "Gasto":
+        with st.form("f_quick_gasto", clear_on_submit=True):
+            q_concepto = st.text_input("Concepto")
+            q_monto    = st.number_input("Monto $", min_value=0.0, step=100.0)
+            c1, c2 = st.columns(2)
+            q_tarjeta  = c1.selectbox("Tarjeta", TARJETAS)
+            q_cat      = c2.selectbox("Categoría", CAT_GASTOS)
+            c3, c4 = st.columns(2)
+            q_fecha    = c3.date_input("Fecha", value=date.today())
+            q_cuotas   = c4.number_input("Cuotas", min_value=1, max_value=48, value=1)
+
+            col_guardar, col_cerrar = st.columns([3, 1])
+            if col_guardar.form_submit_button("💾 Guardar Gasto", use_container_width=True):
+                if q_concepto.strip() and q_monto > 0:
+                    nuevo = pd.DataFrame([[str(q_fecha), q_concepto.strip(), q_monto, q_tarjeta, q_cuotas, q_cat, "No", "", 0, ""]], columns=gastos_df.columns)
+                    gastos_df = pd.concat([gastos_df, nuevo], ignore_index=True)
+                    save("gastos", gastos_df)
+                    st.session_state.menu_accion = False
+                    st.rerun()
+            if col_cerrar.form_submit_button("✕"):
+                st.session_state.menu_accion = False
                 st.rerun()
-        if c_x.form_submit_button("✕"):
-            st.session_state.show_quick_add = False
-            st.rerun()
+
+    # ── Formulario Ingreso ──
+    elif st.session_state.tipo_accion == "Ingreso":
+        with st.form("f_quick_ingreso", clear_on_submit=True):
+            i_concepto = st.text_input("Concepto (Ej: Sueldo, Venta)")
+            i_monto    = st.number_input("Monto $", min_value=0.0, step=1000.0)
+            c1, c2 = st.columns(2)
+            i_cat      = c1.selectbox("Categoría", CAT_ING)
+            i_fecha    = c2.date_input("Fecha", value=date.today())
+            
+            col_guardar, col_cerrar = st.columns([3, 1])
+            if col_guardar.form_submit_button("💰 Guardar Ingreso", use_container_width=True):
+                if i_concepto.strip() and i_monto > 0:
+                    nuevo = pd.DataFrame([[str(i_fecha), i_concepto.strip(), i_monto, i_cat]], columns=ingresos_df.columns)
+                    ingresos_df = pd.concat([ingresos_df, nuevo], ignore_index=True)
+                    save("ingresos", ingresos_df)
+                    st.session_state.menu_accion = False
+                    st.rerun()
+            if col_cerrar.form_submit_button("✕"):
+                st.session_state.menu_accion = False
+                st.rerun()
+
+    # ── Formulario Tarjeta ──
+    elif st.session_state.tipo_accion == "Tarjeta":
+        with st.form("f_quick_tarjeta", clear_on_submit=True):
+            t_nombre = st.text_input("Nombre de Tarjeta")
+            c1, c2 = st.columns(2)
+            t_cierre = c1.number_input("Día de cierre", min_value=1, max_value=28, value=5)
+            t_vence  = c2.number_input("Día de vencimiento", min_value=1, max_value=31, value=20)
+            t_color  = st.selectbox("Color", COLORES_TARJETA)
+            
+            col_guardar, col_cerrar = st.columns([3, 1])
+            if col_guardar.form_submit_button("💳 Crear Tarjeta", use_container_width=True):
+                if t_nombre.strip():
+                    tarj_new = tarjetas_df[tarjetas_df["Nombre"] != t_nombre.strip()].copy()
+                    fila = pd.DataFrame([[t_nombre.strip(), t_cierre, t_vence, t_color]], columns=["Nombre","Dia cierre","Dia vencimiento","Color"])
+                    tarjetas_df = pd.concat([tarj_new, fila], ignore_index=True)
+                    save("tarjetas", tarjetas_df)
+                    st.session_state.menu_accion = False
+                    st.rerun()
+            if col_cerrar.form_submit_button("✕"):
+                st.session_state.menu_accion = False
+                st.rerun()
+                
+    st.markdown("</div>", unsafe_allow_html=True)
+
 
 # ── Tabs Principales ───────────────────────────────────────────────────────────
 tabs = st.tabs(["🏠 Home", "➕ Gastos", "💳 Tarjetas", "💰 Ingresos", "🤝 Compart.", "📈 Inv.", "🎯 Pres."])
@@ -253,7 +316,7 @@ with tabs[0]:
     
     st.markdown(f"<div class='grid2'><div class='card-sm'><div class='card-label'>Ingresos</div><div class='card-value green'>{fmt_ars(total_ing)}</div></div><div class='card-sm'><div class='card-label'>Gastos</div><div class='card-value red'>{fmt_ars(total_gast)}</div></div></div>", unsafe_allow_html=True)
 
-    # FIX: Acumulado total histórico por tarjeta para ver las deudas reales
+    # Acumulado total histórico por tarjeta para no perder de vista nada
     st.markdown("<div class='sec-title'>Total Acumulado por Tarjeta</div>", unsafe_allow_html=True)
     tarjetas_con_gasto = {}
     for tname in TARJETAS:
@@ -281,14 +344,7 @@ with tabs[0]:
 # TAB 1: GASTOS (Vista Optimizada)
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[1]:
-    col_t, col_b = st.columns([2, 1])
-    with col_t:
-        st.markdown("<div class='sec-title'>Historial de Movimientos</div>", unsafe_allow_html=True)
-    with col_b:
-        if st.button("➕ Agregar Gasto", use_container_width=True):
-            st.session_state.show_quick_add = True
-            st.rerun()
-
+    st.markdown("<div class='sec-title'>Historial de Movimientos</div>", unsafe_allow_html=True)
     df_show = gastos_df.sort_values("Fecha", ascending=False)
     
     if df_show.empty:
@@ -309,47 +365,39 @@ with tabs[1]:
             </div>""", unsafe_allow_html=True)
 
         if len(df_show) > st.session_state.gasto_limit:
-            if st.button("Cargar más movimientos ▼"):
+            if st.button("Cargar más movimientos ▼", use_container_width=True):
                 st.session_state.gasto_limit += 25
                 st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2: TARJETAS (Editor y ABM)
+# TAB 2: TARJETAS (Editor y ABM completo)
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[2]:
-    col_tt, col_tb = st.columns([2, 1])
-    with col_tt:
-        st.markdown("<div class='sec-title'>Gestión de Tarjetas</div>", unsafe_allow_html=True)
-    with col_tb:
-        if st.button("➕ Nueva Tarjeta", use_container_width=True):
-            st.session_state.show_add_tarjeta = not st.session_state.show_add_tarjeta
+    # ── EDICIÓN/ELIMINACIÓN DE TARJETAS ──
+    st.markdown("<div class='sec-title'>Modificar y Configurar Mis Tarjetas</div>", unsafe_allow_html=True)
+    st.info("Podés editar el nombre, fechas y color directamente en la tabla. Para eliminar una tarjeta completa, seleccionala y apretá la tecla 'Borrar' (Delete).")
+    
+    if not tarjetas_df.empty:
+        edited_tarjetas = st.data_editor(
+            tarjetas_df,
+            num_rows="dynamic",
+            use_container_width=True
+        )
+        if st.button("💾 Guardar Configuración de Tarjetas", type="primary"):
+            save("tarjetas", edited_tarjetas)
+            st.success("¡Tarjetas actualizadas correctamente!")
             st.rerun()
+    else:
+        st.warning("No tenés tarjetas creadas. Usá el botón '➕ Acciones' de arriba.")
 
-    if st.session_state.show_add_tarjeta:
-        with st.form("f_tarjeta", clear_on_submit=True):
-            st.markdown("### Configurar Tarjeta")
-            t_nombre = st.text_input("Nombre")
-            c1, c2 = st.columns(2)
-            t_cierre = c1.number_input("Día de cierre", min_value=1, max_value=28, value=5)
-            t_vence = c2.number_input("Día de vencimiento", min_value=1, max_value=31, value=20)
-            t_color = st.selectbox("Color", COLORES_TARJETA)
-            if st.form_submit_button("Guardar"):
-                if t_nombre.strip():
-                    tarjetas_df_new = tarjetas_df[tarjetas_df["Nombre"] != t_nombre.strip()].copy()
-                    fila = pd.DataFrame([[t_nombre.strip(), t_cierre, t_vence, t_color]], columns=["Nombre","Dia cierre","Dia vencimiento","Color"])
-                    tarjetas_df_new = pd.concat([tarjetas_df_new, fila], ignore_index=True)
-                    save("tarjetas", tarjetas_df_new)
-                    st.session_state.show_add_tarjeta = False
-                    st.rerun()
-
-    # --- EDICIÓN AVANZADA DE GASTOS POR TARJETA Y PERÍODO ---
     st.divider()
-    st.markdown("<div class='sec-title'>Modificar Datos de Tarjeta</div>", unsafe_allow_html=True)
+
+    # ── EDICIÓN AVANZADA DE GASTOS POR TARJETA Y PERÍODO ──
+    st.markdown("<div class='sec-title'>Modificar Gastos de Tarjeta en un Período</div>", unsafe_allow_html=True)
     
     col_sel1, col_sel2 = st.columns(2)
     t_sel = col_sel1.selectbox("Elegí Tarjeta a editar", TARJETAS)
     
-    # Armar opciones de períodos
     periodos = []
     for delta in range(-5, 2):
         pm, py = m + delta, y
@@ -364,9 +412,18 @@ with tabs[2]:
     df_filtrado_editor = filtrar_gastos_tarjeta_periodo(gastos_df, t_sel, sel_py, sel_pm)
 
     if not df_filtrado_editor.empty:
-        st.info("Hacé doble clic en la celda para editar. Al guardar se actualiza la base.")
+        # Aquí sumamos la lógica para mostrar el total acumulado en ese período específico
+        total_periodo_sel = df_filtrado_editor["Monto"].sum()
         
-        # Guardamos el índice original para poder pisarlo en el dataframe general
+        st.markdown(f"""
+        <div style='background: #2a1010; border: 1px solid #f87171; border-radius: 10px; padding: 15px; margin-bottom: 15px; text-align: center;'>
+            <div style='color: #f87171; font-size: 0.85rem; font-weight: bold; text-transform: uppercase;'>Total acumulado en {t_sel} ({per_sel})</div>
+            <div style='color: #fff; font-size: 1.8rem; font-weight: 800;'>{fmt_ars(total_periodo_sel)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.caption("Doble clic en la celda para editar el gasto. Al guardar pisa la base de datos.")
+        
         df_filtrado_editor['idx_original'] = df_filtrado_editor.index
         
         edited_df = st.data_editor(
@@ -376,18 +433,17 @@ with tabs[2]:
             use_container_width=True
         )
 
-        if st.button("💾 Guardar Cambios en Tarjeta"):
-            # Pisamos los datos originales con los editados
+        if st.button("💾 Guardar Cambios en Gastos de Tarjeta"):
             for original_idx in df_filtrado_editor['idx_original']:
                 gastos_df = gastos_df.drop(index=original_idx)
             
-            # Agregamos los datos que salen del editor
             gastos_df = pd.concat([gastos_df, edited_df], ignore_index=True)
             save("gastos", gastos_df)
-            st.success("¡Base de datos actualizada!")
+            st.success("¡Gastos actualizados y base guardada!")
             st.rerun()
     else:
         st.markdown("<div style='color:#555;font-size:0.85rem;'>No hay gastos para esta tarjeta en este período.</div>", unsafe_allow_html=True)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS RESTANTES (Sin cambios estructurales profundos)
