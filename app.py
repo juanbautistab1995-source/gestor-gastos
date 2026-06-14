@@ -31,10 +31,10 @@ with st.expander("➕ Agregar Gasto Nuevo (Anotador Rápido)"):
             gastos_df.to_csv(DATA_FILE, index=False)
             st.success("¡Anotado!")
 
-# --- 2. TABLA INTERACTIVA (UX MEJORADA) ---
+# --- 2. TABLA INTERACTIVA ---
 st.subheader("📝 Detalle de Gastos")
 edited_gastos = st.data_editor(
-    gastos_gastos_df,
+    gastos_df, # <--- ¡Acá estaba el error, corregido!
     column_config={
         "Compartido": st.column_config.CheckboxColumn("Compartido?"),
         "Monto": st.column_config.NumberColumn("Monto ($)", format="$%d"),
