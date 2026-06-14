@@ -653,18 +653,23 @@ with tabs[0]:
                 if dv > 0:
                     meta_info += f" · Vence día {dv}"
 
-            st.markdown(f"""
-            <div class='tarjeta-card'>
-                <div class='tarjeta-dot' style='background:{color}'></div>
-                <div style='flex:1;min-width:0'>
-                    <div class='tarjeta-nombre'>{tname}</div>
-                    {f"<div class='tarjeta-meta'>{meta_info}</div>" if meta_info else ""}
-                    <div style='margin-top:6px;background:#22223a;border-radius:99px;height:5px;overflow:hidden'>
-                        <div style='width:{pct}%;height:100%;background:{color};border-radius:99px'></div>
-                    </div>
-                </div>
-                <div class='tarjeta-monto' style='color:{color}'>−{fmt_ars(total_t)}</div>
-            </div>""", unsafe_allow_html=True)
+            # Separar el HTML condicional ANTES del f-string para evitar que Streamlit lo escape
+            meta_html = f"<div class='tarjeta-meta'>{meta_info}</div>" if meta_info else ""
+
+            html_tarjeta = (
+                "<div class='tarjeta-card'>"
+                f"<div class='tarjeta-dot' style='background:{color}'></div>"
+                f"<div style='flex:1;min-width:0'>"
+                f"<div class='tarjeta-nombre'>{tname}</div>"
+                f"{meta_html}"
+                f"<div style='margin-top:6px;background:#22223a;border-radius:99px;height:5px;overflow:hidden'>"
+                f"<div style='width:{pct}%;height:100%;background:{color};border-radius:99px'></div>"
+                "</div>"
+                "</div>"
+                f"<div class='tarjeta-monto' style='color:{color}'>−{fmt_ars(total_t)}</div>"
+                "</div>"
+            )
+            st.markdown(html_tarjeta, unsafe_allow_html=True)
     else:
         st.markdown("<div style='color:#555;font-size:0.85rem;text-align:center;padding:0.8rem'>Sin gastos este mes.</div>", unsafe_allow_html=True)
 
