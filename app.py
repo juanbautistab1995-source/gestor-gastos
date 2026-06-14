@@ -2,71 +2,63 @@ import streamlit as st
 import pandas as pd
 import os
 
-# Nombre del archivo donde se va a guardar tu base de datos
 DATA_FILE = "mis_gastos.csv"
+INGRESOS_FILE = "mis_ingresos.csv"
 
-def load_data():
-    """Carga los datos del CSV o crea un DataFrame vacío con las columnas si no existe."""
-    if os.path.exists(DATA_FILE):
-        df = pd.read_csv(DATA_FILE)
-    else:
-        df = pd.DataFrame(columns=[
-            "Tarjeta", "Fecha", "Concepto", "Monto", "Cuotas", 
-            "Categoria", "Compartido", "Con quien", "Cuanto recupero"
-        ])
-    return df
+def load_df(file, cols):
+    if os.path.exists(file): return pd.read_csv(file)
+    return pd.DataFrame(columns=cols)
 
-def save_data(df):
-    """Guarda el DataFrame en el archivo CSV."""
-    df.to_csv(DATA_FILE, index=False)
+st.set_page_config(page_title="Finanzas JuanB", layout="centered")
+st.title("💳 Mi Gestor Diario")
 
-# Configuración de la página
-st.set_page_config(page_title="Gestor de Gastos", page_icon="💳", layout="wide")
-st.title("📊 Gestor de Gastos Casero")
-st.markdown("Bienvenido, **Juan Bautista**. Acá podés editar y analizar toda tu data.")
+# Carga de datos
+gastos_df = load_df(DATA_FILE, ["Tarjeta", "Fecha", "Concepto", "Monto", "Cuotas", "Categoria", "Compartido", "Con quien", "Cuanto recupero"])
+ingresos_df = load_df(INGRESOS_FILE, ["Fecha", "Concepto", "Monto"])
 
-# Cargar la data
-df = load_data()
+# --- 1. BOTÓN DE GASTO RÁPIDO ---
+with st.expander("➕ Agregar Gasto Nuevo (Anotador Rápido)"):
+    with st.form("nuevo_gasto", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        tarjeta = col1.selectbox("Tarjeta", ["Visa ICBC", "Visa Hipotecario", "Master ICBC"])
+        fecha = col2.date_input("Fecha")
+        concepto = st.text_input("Concepto")
+        monto = st.number_input("Monto", min_value=0.0)
+        submitted = st.form_submit_button("Guardar Gasto")
+        if submitted:
+            nuevo = pd.DataFrame([[tarjeta, fecha, concepto, monto, "", "", False, "", 0]], columns=gastos_df.columns)
+            gastos_df = pd.concat([gastos_df, nuevo], ignore_index=True)
+            gastos_df.to_csv(DATA_FILE, index=False)
+            st.success("¡Anotado!")
 
-# Limpiar la columna Monto para poder sumar
-df['Monto_Num'] = pd.to_numeric(df['Monto'].replace('[\$,]', '', regex=True), errors='coerce').fillna(0)
-
-# --- 1. SECCIÓN DE RESUMEN Y MÉTRICAS ---
-st.subheader("📈 Resumen Rápido")
-total_general = df['Monto_Num'].sum()
-gastos_viaje = df[df['Categoria'].str.contains('Viaje con lauti', case=False, na=False)]['Monto_Num'].sum()
-
-col1, col2 = st.columns(2)
-col1.metric("Total Acumulado", f"$ {total_general:,.2f}")
-col2.metric("Total Viaje Mendoza", f"$ {gastos_viaje:,.2f}")
-st.divider()
-
-# --- 2. SECCIÓN DE EDICIÓN ---
-st.subheader("📝 Tabla Interactiva (Editá, agregá o borrá filas)")
-st.info("Podés hacer doble clic en cualquier celda para editarla. Al final de la tabla podés agregar filas nuevas.")
-
-edited_df = st.data_editor(
-    df.drop(columns=['Monto_Num']),
-    num_rows="dynamic",
-    use_container_width=True,
-    height=400
+# --- 2. TABLA INTERACTIVA (UX MEJORADA) ---
+st.subheader("📝 Detalle de Gastos")
+edited_gastos = st.data_editor(
+    gastos_gastos_df,
+    column_config={
+        "Compartido": st.column_config.CheckboxColumn("Compartido?"),
+        "Monto": st.column_config.NumberColumn("Monto ($)", format="$%d"),
+    },
+    num_rows="dynamic"
 )
 
-# Botón para guardar
-if st.button("💾 Guardar Cambios"):
-    save_data(edited_df)
-    st.success("¡Datos guardados joya! Actualizá la página para ver los nuevos totales.")
+if st.button("💾 Guardar Cambios en Tabla"):
+    edited_gastos.to_csv(DATA_FILE, index=False)
     st.rerun()
 
+# --- 3. INGRESOS Y BALANCE ---
 st.divider()
+st.subheader("💰 Balance General")
+col_ing, col_bal = st.columns(2)
+with col_ing:
+    total_ing = ingresos_df['Monto'].sum()
+    st.metric("Total Ingresos", f"${total_ing:,.0f}")
+with col_bal:
+    total_gast = gastos_df['Monto'].sum()
+    st.metric("Balance Neto", f"${total_ing - total_gast:,.0f}")
 
-# --- 3. SECCIÓN DE FILTROS ---
-st.subheader("🔍 Analizar por Tarjeta")
-lista_tarjetas = ["Todas"] + list(edited_df['Tarjeta'].dropna().unique())
-tarjeta_sel = st.selectbox("Elegí una tarjeta para filtrar:", lista_tarjetas)
-
-if tarjeta_sel != "Todas":
-    df_filtrado = edited_df[edited_df['Tarjeta'] == tarjeta_sel]
-    st.dataframe(df_filtrado, use_container_width=True)
-    df_filtrado['Monto_Num'] = pd.to_numeric(df_filtrado['Monto'].replace('[\$,]', '', regex=True), errors='coerce').fillna(0)
-    st.caption(f"**Total gastado en {tarjeta_sel}:** $ {df_filtrado['Monto_Num'].sum():,.2f}")
+with st.expander("Editar Ingresos"):
+    edited_ingresos = st.data_editor(ingresos_df, num_rows="dynamic")
+    if st.button("Guardar Ingresos"):
+        edited_ingresos.to_csv(INGRESOS_FILE, index=False)
+        st.rerun()
