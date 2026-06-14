@@ -3,6 +3,7 @@ import pandas as pd
 import os
 from datetime import date, datetime, timedelta
 import calendar
+import io
 
 # ── Archivos ───────────────────────────────────────────────────────────────────
 FILES = {
@@ -176,13 +177,21 @@ html, body, [class*="css"], .stApp {
 .tx-monto { margin-left: auto; font-size: 0.95rem; font-weight: 700; text-align: right; }
 
 /* Formularios e inputs */
-.stTextInput input, .stNumberInput input, .stDateInput input, .stSelectbox div[data-baseweb="select"] > div { background: #1e1e2c !important; border: 1px solid #2e2e44 !important; border-radius: 10px !important; color: #e8e8f0 !important; font-size: 0.9rem !important; }
+.stTextInput input, .stNumberInput input, .stDateInput input, .stSelectbox div[data-baseweb="select"] > div, .stTextArea textarea { background: #1e1e2c !important; border: 1px solid #2e2e44 !important; border-radius: 10px !important; color: #e8e8f0 !important; font-size: 0.9rem !important; }
 label[data-testid="stWidgetLabel"] p { font-size: 0.75rem !important; font-weight: 600 !important; color: #888 !important; text-transform: uppercase; }
 
-/* Botones principales de la UI */
-div[data-testid="stButton"] button {
+/* ── FIX BOTONES BLANCOS ── */
+div[data-testid="stButton"] > button, div[data-testid="stFormSubmitButton"] > button {
+    background-color: #7c6af7 !important;
+    color: #ffffff !important;
+    border: none !important;
     border-radius: 12px !important;
     font-weight: 700 !important;
+    transition: all 0.2s ease !important;
+}
+div[data-testid="stButton"] > button:hover, div[data-testid="stFormSubmitButton"] > button:hover {
+    background-color: #6b59e6 !important;
+    color: #ffffff !important;
 }
 
 .sec-title { font-size: 0.72rem; font-weight: 700; color: #666; text-transform: uppercase; letter-spacing: 0.1em; margin: 1.1rem 0 0.5rem; }
@@ -220,12 +229,11 @@ remanente   = total_ing - total_gast + recupero
 TARJETAS = get_tarjetas_nombres()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MENÚ FLOTANTE DE ACCIÓN RÁPIDA (UX Optimizada)
+# MENÚ FLOTANTE DE ACCIÓN RÁPIDA
 # ══════════════════════════════════════════════════════════════════════════════
-# En lugar de un botón CSS que se rompe, usamos un contenedor principal claro
 col_espacio, col_boton = st.columns([3, 1])
 with col_boton:
-    if st.button("➕ Acciones", use_container_width=True, type="primary"):
+    if st.button("➕ Acciones", use_container_width=True):
         st.session_state.menu_accion = not st.session_state.menu_accion
 
 if st.session_state.menu_accion:
@@ -233,7 +241,6 @@ if st.session_state.menu_accion:
     
     st.session_state.tipo_accion = st.radio("¿Qué querés agregar?", ["Gasto", "Ingreso", "Tarjeta"], horizontal=True, label_visibility="collapsed")
     
-    # ── Formulario Gasto ──
     if st.session_state.tipo_accion == "Gasto":
         with st.form("f_quick_gasto", clear_on_submit=True):
             q_concepto = st.text_input("Concepto")
@@ -257,7 +264,6 @@ if st.session_state.menu_accion:
                 st.session_state.menu_accion = False
                 st.rerun()
 
-    # ── Formulario Ingreso ──
     elif st.session_state.tipo_accion == "Ingreso":
         with st.form("f_quick_ingreso", clear_on_submit=True):
             i_concepto = st.text_input("Concepto (Ej: Sueldo, Venta)")
@@ -278,7 +284,6 @@ if st.session_state.menu_accion:
                 st.session_state.menu_accion = False
                 st.rerun()
 
-    # ── Formulario Tarjeta ──
     elif st.session_state.tipo_accion == "Tarjeta":
         with st.form("f_quick_tarjeta", clear_on_submit=True):
             t_nombre = st.text_input("Nombre de Tarjeta")
@@ -316,7 +321,6 @@ with tabs[0]:
     
     st.markdown(f"<div class='grid2'><div class='card-sm'><div class='card-label'>Ingresos</div><div class='card-value green'>{fmt_ars(total_ing)}</div></div><div class='card-sm'><div class='card-label'>Gastos</div><div class='card-value red'>{fmt_ars(total_gast)}</div></div></div>", unsafe_allow_html=True)
 
-    # Acumulado total histórico por tarjeta para no perder de vista nada
     st.markdown("<div class='sec-title'>Total Acumulado por Tarjeta</div>", unsafe_allow_html=True)
     tarjetas_con_gasto = {}
     for tname in TARJETAS:
@@ -341,9 +345,46 @@ with tabs[0]:
         st.markdown("<div style='color:#555;font-size:0.85rem;text-align:center;'>Sin gastos cargados.</div>", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1: GASTOS (Vista Optimizada)
+# TAB 1: GASTOS (Vista Optimizada + Carga Masiva)
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[1]:
+    
+    # ── CARGA MASIVA CSV ──
+    with st.expander("📥 Carga Masiva (Pegar texto CSV / TXT)"):
+        st.info("Pegá acá el texto CSV que yo te arme desde el chat. El sistema acomoda automáticamente las columnas y te guarda todo de un saque.")
+        csv_text = st.text_area("Texto CSV:", height=150)
+        
+        if st.button("🚀 Procesar e Importar Gastos", use_container_width=True):
+            if csv_text.strip():
+                try:
+                    nuevos_datos = pd.read_csv(io.StringIO(csv_text.strip()))
+                    
+                    # Rellenar las columnas que exige la base por si faltan en el CSV
+                    for col in gastos_df.columns:
+                        if col not in nuevos_datos.columns:
+                            if col in ["Monto", "Cuanto recupero"]:
+                                nuevos_datos[col] = 0
+                            elif col == "Compartido":
+                                nuevos_datos[col] = "No"
+                            else:
+                                nuevos_datos[col] = ""
+                    
+                    # Filtramos y ordenamos según la base principal
+                    nuevos_datos = nuevos_datos[gastos_df.columns]
+                    
+                    # Añadir al dataframe original y guardar
+                    gastos_df = pd.concat([gastos_df, nuevos_datos], ignore_index=True)
+                    save("gastos", gastos_df)
+                    st.success(f"¡Éxito! Se agregaron {len(nuevos_datos)} movimientos a la base de datos.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Hubo un error al leer el texto. Asegurate de que sea el formato que te pasé. Detalle: {e}")
+            else:
+                st.warning("¡Primero pegá el texto antes de procesar!")
+
+    st.divider()
+
+    # ── LISTADO DE MOVIMIENTOS ──
     st.markdown("<div class='sec-title'>Historial de Movimientos</div>", unsafe_allow_html=True)
     df_show = gastos_df.sort_values("Fecha", ascending=False)
     
@@ -373,9 +414,8 @@ with tabs[1]:
 # TAB 2: TARJETAS (Editor y ABM completo)
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[2]:
-    # ── EDICIÓN/ELIMINACIÓN DE TARJETAS ──
     st.markdown("<div class='sec-title'>Modificar y Configurar Mis Tarjetas</div>", unsafe_allow_html=True)
-    st.info("Podés editar el nombre, fechas y color directamente en la tabla. Para eliminar una tarjeta completa, seleccionala y apretá la tecla 'Borrar' (Delete).")
+    st.info("Podés editar el nombre, fechas y color directamente en la tabla. Para eliminar una tarjeta, seleccioná la fila y apretá borrar en tu teclado.")
     
     if not tarjetas_df.empty:
         edited_tarjetas = st.data_editor(
@@ -383,7 +423,7 @@ with tabs[2]:
             num_rows="dynamic",
             use_container_width=True
         )
-        if st.button("💾 Guardar Configuración de Tarjetas", type="primary"):
+        if st.button("💾 Guardar Configuración de Tarjetas", use_container_width=True):
             save("tarjetas", edited_tarjetas)
             st.success("¡Tarjetas actualizadas correctamente!")
             st.rerun()
@@ -392,9 +432,7 @@ with tabs[2]:
 
     st.divider()
 
-    # ── EDICIÓN AVANZADA DE GASTOS POR TARJETA Y PERÍODO ──
     st.markdown("<div class='sec-title'>Modificar Gastos de Tarjeta en un Período</div>", unsafe_allow_html=True)
-    
     col_sel1, col_sel2 = st.columns(2)
     t_sel = col_sel1.selectbox("Elegí Tarjeta a editar", TARJETAS)
     
@@ -412,7 +450,6 @@ with tabs[2]:
     df_filtrado_editor = filtrar_gastos_tarjeta_periodo(gastos_df, t_sel, sel_py, sel_pm)
 
     if not df_filtrado_editor.empty:
-        # Aquí sumamos la lógica para mostrar el total acumulado en ese período específico
         total_periodo_sel = df_filtrado_editor["Monto"].sum()
         
         st.markdown(f"""
@@ -433,7 +470,7 @@ with tabs[2]:
             use_container_width=True
         )
 
-        if st.button("💾 Guardar Cambios en Gastos de Tarjeta"):
+        if st.button("💾 Guardar Cambios en Gastos de Tarjeta", use_container_width=True):
             for original_idx in df_filtrado_editor['idx_original']:
                 gastos_df = gastos_df.drop(index=original_idx)
             
@@ -443,7 +480,6 @@ with tabs[2]:
             st.rerun()
     else:
         st.markdown("<div style='color:#555;font-size:0.85rem;'>No hay gastos para esta tarjeta en este período.</div>", unsafe_allow_html=True)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS RESTANTES (Sin cambios estructurales profundos)
