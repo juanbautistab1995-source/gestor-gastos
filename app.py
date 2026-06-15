@@ -976,30 +976,42 @@ with tabs[2]:
     )
 
     if not df_per.empty:
-        # Editor de gastos del período — FIX: columnas Compartido y Con quien editables
         df_per_ed = df_per.copy()
         df_per_ed["_idx"] = df_per_ed.index
+
+        # Limpiar y tipar cada columna antes del editor para evitar StreamlitAPIException
+        df_per_ed["Monto"]           = pd.to_numeric(df_per_ed["Monto"], errors="coerce").fillna(0)
+        df_per_ed["Cuotas"]          = pd.to_numeric(df_per_ed["Cuotas"], errors="coerce").fillna(1).astype(int)
+        df_per_ed["Cuanto recupero"] = pd.to_numeric(df_per_ed["Cuanto recupero"], errors="coerce").fillna(0)
+        df_per_ed["Compartido"]      = df_per_ed["Compartido"].astype(str).str.strip().replace({"Si":"Sí","nan":"No","":"No"}).fillna("No")
+        df_per_ed["Con quien"]       = df_per_ed["Con quien"].fillna("").astype(str)
+        df_per_ed["Notas"]           = df_per_ed["Notas"].fillna("").astype(str)
+        df_per_ed["Concepto"]        = df_per_ed["Concepto"].fillna("").astype(str)
+        df_per_ed["Categoria"]       = df_per_ed["Categoria"].fillna("💳 Otro").astype(str)
+        df_per_ed["Tarjeta"]         = df_per_ed["Tarjeta"].fillna("").astype(str)
+        df_per_ed["Fecha"]           = pd.to_datetime(df_per_ed["Fecha"], errors="coerce").dt.date
+
         edited_per = st.data_editor(
             df_per_ed.drop(columns=["_idx"]),
             num_rows="dynamic",
             use_container_width=True,
             column_config={
-                "Fecha":          st.column_config.DateColumn("Fecha"),
-                "Monto":          st.column_config.NumberColumn("Monto $", format="$%d"),
-                "Cuotas":         st.column_config.NumberColumn("Cuotas", min_value=1, max_value=48),
-                "Compartido":     st.column_config.SelectboxColumn("Compartido", options=["No","Sí"]),
-                "Con quien":      st.column_config.TextColumn("Con quién"),
-                "Cuanto recupero":st.column_config.NumberColumn("Recupero $", format="$%d"),
-                "Notas":          st.column_config.TextColumn("Notas"),
-                "Tarjeta":        st.column_config.SelectboxColumn("Tarjeta", options=TARJETAS),
-                "Categoria":      st.column_config.SelectboxColumn("Categoría", options=CAT_GASTOS),
+                "Fecha":           st.column_config.DateColumn("Fecha"),
+                "Concepto":        st.column_config.TextColumn("Concepto"),
+                "Monto":           st.column_config.NumberColumn("Monto $", format="$%d", min_value=0),
+                "Cuotas":          st.column_config.NumberColumn("Cuotas", min_value=1, max_value=48, step=1),
+                "Compartido":      st.column_config.TextColumn("Compartido"),
+                "Con quien":       st.column_config.TextColumn("Con quién"),
+                "Cuanto recupero": st.column_config.NumberColumn("Recupero $", format="$%d", min_value=0),
+                "Notas":           st.column_config.TextColumn("Notas"),
+                "Tarjeta":         st.column_config.TextColumn("Tarjeta"),
+                "Categoria":       st.column_config.TextColumn("Categoría"),
             },
             key=f"editor_gastos_{t_sel}_{sel_py}_{sel_pm}"
         )
         if st.button("Guardar cambios en gastos", key="save_per"):
-            for orig_idx in df_per_ed["_idx"]:
-                if orig_idx in gastos_df.index:
-                    gastos_df = gastos_df.drop(index=orig_idx)
+            orig_indices = df_per_ed["_idx"].tolist()
+            gastos_df = gastos_df.drop(index=[i for i in orig_indices if i in gastos_df.index])
             gastos_df = pd.concat([gastos_df, edited_per], ignore_index=True)
             save("gastos", gastos_df)
             st.success("Gastos actualizados.")
