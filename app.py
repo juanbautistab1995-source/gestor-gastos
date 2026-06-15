@@ -35,6 +35,9 @@ def load(key):
 
 def save(key, df):
     f, _ = FILES[key]
+    # Limpiamos la columna de ordenamiento temporal antes de guardar si existe
+    if "_sort_date" in df.columns:
+        df = df.drop(columns=["_sort_date"])
     df.to_csv(f, index=False)
 
 def to_num(s):
@@ -50,7 +53,7 @@ def mes_actual():
 def filtrar_mes(df, y, m):
     if df.empty or "Fecha" not in df.columns:
         return df
-    fechas = pd.to_datetime(df["Fecha"], errors="coerce")
+    fechas = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
     return df[(fechas.dt.year == y) & (fechas.dt.month == m)]
 
 def fmt_ars(n):
@@ -545,6 +548,9 @@ for col in ["Monto","Cuanto recupero"]:
 ingresos_df["Monto"] = to_num(ingresos_df["Monto"])
 comp_df["Monto"]     = to_num(comp_df["Monto"])
 
+# Columna temporal para ordenar fechas rigurosamente sin romper el CSV
+gastos_df["_sort_date"] = pd.to_datetime(gastos_df["Fecha"], errors="coerce", dayfirst=True)
+
 y, m = mes_actual()
 nombre_mes = calendar.month_name[m].capitalize()
 gastos_mes   = filtrar_mes(gastos_df, y, m)
@@ -591,7 +597,7 @@ if st.session_state.menu_accion:
             c5,c6 = st.columns(2)
             q_f = c5.date_input("Fecha", value=date.today())
             q_cu = c6.number_input("Cuotas", min_value=1, max_value=48, value=1)
-            # preview período
+            
             ay_p, am_p = periodo_actual_de_gasto(str(q_f), q_t)
             if ay_p != y or am_p != m:
                 mn = calendar.month_name[am_p][:3]
@@ -599,7 +605,7 @@ if st.session_state.menu_accion:
             ca, cb = st.columns([3,1])
             if ca.form_submit_button("Guardar gasto"):
                 if q_c.strip() and q_m > 0:
-                    nv = pd.DataFrame([[str(q_f),q_c.strip(),q_m,q_t,q_cu,q_k,"No","",0,""]], columns=gastos_df.columns)
+                    nv = pd.DataFrame([[str(q_f),q_c.strip(),q_m,q_t,q_cu,q_k,"No","",0,""]], columns=["Fecha","Concepto","Monto","Tarjeta","Cuotas","Categoria","Compartido","Con quien","Cuanto recupero","Notas"])
                     gastos_df = pd.concat([gastos_df,nv], ignore_index=True)
                     save("gastos", gastos_df)
                     st.session_state.menu_accion = False
@@ -664,7 +670,6 @@ tabs = st.tabs(["Inicio","Gastos","Tarjetas","Ingresos","Compartidos","Inversion
 # TAB 0 — INICIO
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[0]:
-    # Hero: remanente
     color_hero = "c-pos" if remanente >= 0 else "c-neg"
     st.markdown(f"""
     <div class='hero-block'>
@@ -673,7 +678,6 @@ with tabs[0]:
         <div class='hero-sub'>ingresos − gastos + recupero</div>
     </div>""", unsafe_allow_html=True)
 
-    # Stat row
     st.markdown(f"""
     <div class='stat-row'>
         <div class='stat-cell'>
@@ -687,14 +691,11 @@ with tabs[0]:
         {"<div class='stat-cell'><div class='stat-label'>Recuperás</div><div class='stat-val c-yel'>" + fmt_ars(recupero) + "</div></div>" if recupero > 0 else ""}
     </div>""", unsafe_allow_html=True)
 
-    # Tarjetas del período actual
-    st.markdown("<div class='sec'>Esta quincena / período</div>", unsafe_allow_html=True)
+    # ── FIX: Mostrar Total Acumulado Histórico por Tarjeta ──
+    st.markdown("<div class='sec'>Total Acumulado por Tarjeta</div>", unsafe_allow_html=True)
     tarjetas_con_gasto = {}
     for tname in TARJETAS:
-        if not tarjetas_df.empty and tname in tarjetas_df["Nombre"].values:
-            gf = filtrar_gastos_tarjeta_periodo(gastos_df, tname, y, m)
-        else:
-            gf = gastos_mes[gastos_mes["Tarjeta"] == tname] if not gastos_mes.empty else pd.DataFrame(columns=gastos_df.columns)
+        gf = gastos_df[gastos_df["Tarjeta"] == tname]
         gf_monto = gf["Monto"].sum() if not gf.empty else 0
         if gf_monto > 0:
             tarjetas_con_gasto[tname] = gf_monto
@@ -703,7 +704,7 @@ with tabs[0]:
         max_t = max(tarjetas_con_gasto.values())
         for tname, total_t in sorted(tarjetas_con_gasto.items(), key=lambda x: -x[1]):
             color = get_color_tarjeta(tname, tarjetas_df)
-            pct = int(total_t / max_t * 100)
+            pct = int(total_t / max_t * 100) if max_t > 0 else 0
             meta_html = ""
             if not tarjetas_df.empty and tname in tarjetas_df["Nombre"].values:
                 row_i = tarjetas_df[tarjetas_df["Nombre"] == tname].iloc[0]
@@ -720,9 +721,8 @@ with tabs[0]:
                 unsafe_allow_html=True
             )
     else:
-        st.markdown("<div class='empty'><big>💸</big>Todavía no hay gastos este período.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='empty'><big>💸</big>Todavía no hay gastos.</div>", unsafe_allow_html=True)
 
-    # Categorías
     if not gastos_mes.empty:
         st.markdown("<div class='sec'>Por categoría</div>", unsafe_allow_html=True)
         cat_sum = gastos_mes.groupby("Categoria")["Monto"].sum().sort_values(ascending=False).head(6)
@@ -740,9 +740,9 @@ with tabs[0]:
                 unsafe_allow_html=True
             )
 
-    # Últimos movimientos
+    # ── FIX: Movimientos ordenados bien por la fecha ──
     st.markdown("<div class='sec'>Últimos movimientos</div>", unsafe_allow_html=True)
-    recientes = gastos_df.sort_values("Fecha", ascending=False).head(6)
+    recientes = gastos_df.sort_values("_sort_date", ascending=False).head(6)
     if recientes.empty:
         st.markdown("<div class='empty'><big>📋</big>Sin movimientos todavía.</div>", unsafe_allow_html=True)
     else:
@@ -768,7 +768,6 @@ with tabs[0]:
                 unsafe_allow_html=True
             )
 
-    # Pendientes
     pend = comp_df[comp_df["Estado"] == "Pendiente"] if not comp_df.empty else pd.DataFrame()
     if not pend.empty:
         st.markdown("<div class='sec'>Te deben</div>", unsafe_allow_html=True)
@@ -797,7 +796,6 @@ with tabs[0]:
 # TAB 1 — GASTOS
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[1]:
-    # Carga masiva
     with st.expander("📥 Importar desde CSV"):
         st.markdown("<div class='info-strip'>Pegá el texto CSV del chat. Las columnas que falten se completan automáticamente.</div>", unsafe_allow_html=True)
         csv_text = st.text_area("", placeholder="Fecha,Concepto,Monto,Tarjeta...", height=120, label_visibility="collapsed")
@@ -805,10 +803,11 @@ with tabs[1]:
             if csv_text.strip():
                 try:
                     nuevos = pd.read_csv(io.StringIO(csv_text.strip()))
-                    for col in gastos_df.columns:
+                    columnas_necesarias = ["Fecha","Concepto","Monto","Tarjeta","Cuotas","Categoria","Compartido","Con quien","Cuanto recupero","Notas"]
+                    for col in columnas_necesarias:
                         if col not in nuevos.columns:
                             nuevos[col] = 0 if col in ["Monto","Cuanto recupero"] else ("No" if col=="Compartido" else "")
-                    nuevos = nuevos[gastos_df.columns]
+                    nuevos = nuevos[columnas_necesarias]
                     gastos_df = pd.concat([gastos_df, nuevos], ignore_index=True)
                     save("gastos", gastos_df)
                     st.success(f"{len(nuevos)} movimientos importados.")
@@ -818,7 +817,6 @@ with tabs[1]:
             else:
                 st.warning("Pegá el CSV primero.")
 
-    # Formulario manual
     with st.expander("✏️ Carga manual"):
         with st.form("f_gasto_full", clear_on_submit=True):
             g_c = st.text_input("Concepto", placeholder="Ej: almuerzo, nafta, cuota…")
@@ -837,7 +835,7 @@ with tabs[1]:
             g_nota = st.text_input("Nota", placeholder="Opcional")
             if st.form_submit_button("Guardar gasto"):
                 if g_c.strip() and g_m > 0:
-                    nv = pd.DataFrame([[str(g_f),g_c.strip(),g_m,g_t,g_cu,g_k,g_comp,g_quien,g_rec,g_nota]], columns=gastos_df.columns)
+                    nv = pd.DataFrame([[str(g_f),g_c.strip(),g_m,g_t,g_cu,g_k,g_comp,g_quien,g_rec,g_nota]], columns=["Fecha","Concepto","Monto","Tarjeta","Cuotas","Categoria","Compartido","Con quien","Cuanto recupero","Notas"])
                     gastos_df = pd.concat([gastos_df,nv], ignore_index=True)
                     save("gastos", gastos_df)
                     if g_comp == "Sí" and g_rec > 0:
@@ -850,7 +848,6 @@ with tabs[1]:
                 else:
                     st.warning("Completá concepto y monto.")
 
-    # Eliminar
     with st.expander("🗑️ Eliminar gastos"):
         del_q = st.text_input("Buscar concepto", key="del_g", placeholder="Escribí parte del concepto…")
         if del_q:
@@ -867,9 +864,8 @@ with tabs[1]:
                             save("gastos", gastos_df)
                             st.rerun()
 
-    # Listado
     st.markdown("<div class='sec'>Todos los movimientos</div>", unsafe_allow_html=True)
-    df_show = gastos_df.sort_values("Fecha", ascending=False)
+    df_show = gastos_df.sort_values("_sort_date", ascending=False)
     if df_show.empty:
         st.markdown("<div class='empty'><big>📋</big>Nada cargado todavía.</div>", unsafe_allow_html=True)
     else:
@@ -909,7 +905,6 @@ with tabs[1]:
 with tabs[2]:
     tarjetas_df = load("tarjetas")
 
-    # Editor ABM
     st.markdown("<div class='sec'>Configuración de tarjetas</div>", unsafe_allow_html=True)
     if not tarjetas_df.empty:
         edited_t = st.data_editor(
@@ -933,7 +928,6 @@ with tabs[2]:
 
     st.markdown("<div class='sec'>Gastos por tarjeta y período</div>", unsafe_allow_html=True)
 
-    # Selector tarjeta + período
     c1, c2 = st.columns(2)
     t_sel = c1.selectbox("Tarjeta", TARJETAS, key="t_sel_tab")
     periodos = []
@@ -950,7 +944,6 @@ with tabs[2]:
     df_per = filtrar_gastos_tarjeta_periodo(gastos_df, t_sel, sel_py, sel_pm)
     total_per = df_per["Monto"].sum() if not df_per.empty else 0
 
-    # Badge período
     hoy_d = date.today()
     if fin_p < hoy_d:
         badge_class, badge_ico = "closed", "🔒"
@@ -965,7 +958,6 @@ with tabs[2]:
         unsafe_allow_html=True
     )
 
-    # Total período
     color_t_sel = get_color_tarjeta(t_sel, tarjetas_df)
     st.markdown(
         "<div class='total-strip'>"
@@ -978,8 +970,9 @@ with tabs[2]:
     if not df_per.empty:
         df_per_ed = df_per.copy()
         df_per_ed["_idx"] = df_per_ed.index
+        if "_sort_date" in df_per_ed.columns:
+            df_per_ed = df_per_ed.drop(columns=["_sort_date"])
 
-        # Limpiar y tipar cada columna antes del editor para evitar StreamlitAPIException
         df_per_ed["Monto"]           = pd.to_numeric(df_per_ed["Monto"], errors="coerce").fillna(0)
         df_per_ed["Cuotas"]          = pd.to_numeric(df_per_ed["Cuotas"], errors="coerce").fillna(1).astype(int)
         df_per_ed["Cuanto recupero"] = pd.to_numeric(df_per_ed["Cuanto recupero"], errors="coerce").fillna(0)
@@ -989,7 +982,7 @@ with tabs[2]:
         df_per_ed["Concepto"]        = df_per_ed["Concepto"].fillna("").astype(str)
         df_per_ed["Categoria"]       = df_per_ed["Categoria"].fillna("💳 Otro").astype(str)
         df_per_ed["Tarjeta"]         = df_per_ed["Tarjeta"].fillna("").astype(str)
-        df_per_ed["Fecha"]           = pd.to_datetime(df_per_ed["Fecha"], errors="coerce").dt.date
+        df_per_ed["Fecha"]           = pd.to_datetime(df_per_ed["Fecha"], errors="coerce", dayfirst=True).dt.date
 
         edited_per = st.data_editor(
             df_per_ed.drop(columns=["_idx"]),
