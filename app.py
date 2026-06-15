@@ -22,7 +22,22 @@ MONEDAS    = ["ARS","USD","EUR"]
 COLORES_TARJETA = ["#7c6af7","#4ade80","#f87171","#fbbf24","#60a5fa","#f472b6","#34d399","#fb923c"]
 TARJETAS_DEFAULT = ["Visa ICBC","Visa Hipotecario","Master ICBC","Efectivo","Débito","Otro"]
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers Core ───────────────────────────────────────────────────────────────
+
+def normalize_dates(df, col="Fecha"):
+    """Traduce meses en español y normaliza todo a YYYY-MM-DD para evitar corrupción de datos"""
+    if col not in df.columns or df.empty: return df
+    s = df[col].astype(str).str.lower().str.strip()
+    s = s.str.split(" ").str[0] # Limpiar horas si las hay
+    s = s.replace(["s/f", "nan", "nat", "none", ""], pd.NA)
+    meses = {"ene":"01", "feb":"02", "mar":"03", "abr":"04", "may":"05", "jun":"06",
+             "jul":"07", "ago":"08", "sep":"09", "oct":"10", "nov":"11", "dic":"12"}
+    for k, v in meses.items():
+        s = s.str.replace(k, v, regex=False)
+    parsed = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    df[col] = parsed.dt.strftime("%Y-%m-%d").fillna("S/F")
+    return df
+
 def load(key):
     f, cols = FILES[key]
     if os.path.exists(f):
@@ -30,15 +45,14 @@ def load(key):
         for c in cols:
             if c not in df.columns:
                 df[c] = ""
+        # Aplicamos la normalización de fechas apenas cargamos la base
+        if key in ["gastos", "ingresos", "compartidos", "inversiones"]:
+            df = normalize_dates(df, "Fecha")
         return df[cols]
     return pd.DataFrame(columns=cols)
 
 def save(key, df):
     f, _ = FILES[key]
-    # Limpiamos variables temporales de memoria antes de guardar
-    cols_to_drop = [c for c in ["_sort_date", "_idx"] if c in df.columns]
-    if cols_to_drop:
-        df = df.drop(columns=cols_to_drop)
     df.to_csv(f, index=False)
 
 def to_num(s):
@@ -54,7 +68,7 @@ def mes_actual():
 def filtrar_mes(df, y, m):
     if df.empty or "Fecha" not in df.columns:
         return df
-    fechas = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
+    fechas = pd.to_datetime(df["Fecha"], errors="coerce")
     return df[(fechas.dt.year == y) & (fechas.dt.month == m)]
 
 def fmt_ars(n):
@@ -72,20 +86,18 @@ def safe_int(val, default=1):
         return default
 
 def get_tarjetas_nombres():
-    """Lee las tarjetas configuradas y además escanea los gastos para detectar tarjetas importadas por CSV"""
+    """Escanea la config y el CSV de gastos para detectar tarjetas importadas a la fuerza"""
     t_df = load("tarjetas")
     nombres = t_df["Nombre"].dropna().tolist() if not t_df.empty else []
     
-    # Agregar las default
     for d in TARJETAS_DEFAULT:
         if d not in nombres: nombres.append(d)
         
-    # Escaneo inteligente: si importaste un CSV con una tarjeta nueva, aparece automáticamente
     g_df = load("gastos")
     if not g_df.empty and "Tarjeta" in g_df.columns:
         for t in g_df["Tarjeta"].dropna().unique():
             t_str = str(t).strip()
-            if t_str and t_str not in nombres:
+            if t_str and t_str not in ("nan", "None", "S/F") and t_str not in nombres:
                 nombres.append(t_str)
                 
     return nombres
@@ -106,10 +118,13 @@ def get_periodo_tarjeta(tarjeta_nombre, año=None, mes=None):
     return inicio, fin
 
 def periodo_actual_de_gasto(fecha_str, tarjeta_nombre):
+    if pd.isna(fecha_str) or str(fecha_str) == "S/F":
+        hoy = date.today(); return hoy.year, hoy.month
     try:
-        fg = pd.to_datetime(fecha_str).date()
+        fg = pd.to_datetime(str(fecha_str)).date()
     except:
         hoy = date.today(); return hoy.year, hoy.month
+        
     t_df = load("tarjetas")
     if t_df.empty or tarjeta_nombre not in t_df["Nombre"].values:
         return fg.year, fg.month
@@ -427,16 +442,6 @@ div[data-testid="stFormSubmitButton"] > button:hover {
     background: #5a52e0 !important;
     color: #fff !important;
 }
-.btn-ghost > div[data-testid="stButton"] > button {
-    background: transparent !important;
-    border: 1px solid #1e1e30 !important;
-    color: #555 !important;
-}
-.btn-danger > div[data-testid="stButton"] > button {
-    background: #ff5f7e18 !important;
-    border: 1px solid #ff5f7e30 !important;
-    color: #ff5f7e !important;
-}
 
 /* ── INPUTS ── */
 .stTextInput input, .stNumberInput input, .stDateInput input,
@@ -558,9 +563,6 @@ for col in ["Monto","Cuanto recupero"]:
     gastos_df[col] = to_num(gastos_df[col])
 ingresos_df["Monto"] = to_num(ingresos_df["Monto"])
 comp_df["Monto"]     = to_num(comp_df["Monto"])
-
-# Ordenamiento temporal blindado
-gastos_df["_sort_date"] = pd.to_datetime(gastos_df["Fecha"], errors="coerce", dayfirst=True)
 
 y, m = mes_actual()
 nombre_mes = calendar.month_name[m].capitalize()
@@ -751,7 +753,11 @@ with tabs[0]:
             )
 
     st.markdown("<div class='sec'>Últimos movimientos</div>", unsafe_allow_html=True)
-    recientes = gastos_df.sort_values("_sort_date", ascending=False).head(6)
+    # Creamos una columna de casteo segura solo para que "S/F" vaya al fondo siempre
+    sort_df = gastos_df.copy()
+    sort_df["_sort"] = pd.to_datetime(sort_df["Fecha"], errors="coerce")
+    recientes = sort_df.sort_values("_sort", ascending=False).head(6)
+    
     if recientes.empty:
         st.markdown("<div class='empty'><big>📋</big>Sin movimientos todavía.</div>", unsafe_allow_html=True)
     else:
@@ -818,6 +824,8 @@ with tabs[1]:
                             nuevos[col] = 0 if col in ["Monto","Cuanto recupero"] else ("No" if col=="Compartido" else "")
                     nuevos = nuevos[columnas_necesarias]
                     gastos_df = pd.concat([gastos_df, nuevos], ignore_index=True)
+                    # Normalizamos las fechas que puedan venir raras del CSV inyectado
+                    gastos_df = normalize_dates(gastos_df, "Fecha")
                     save("gastos", gastos_df)
                     st.success(f"{len(nuevos)} movimientos importados.")
                     st.rerun()
@@ -874,7 +882,11 @@ with tabs[1]:
                             st.rerun()
 
     st.markdown("<div class='sec'>Todos los movimientos</div>", unsafe_allow_html=True)
-    df_show = gastos_df.sort_values("_sort_date", ascending=False)
+    # Usar _sort dinámico para empujar los S/F siempre abajo
+    sort_df2 = gastos_df.copy()
+    sort_df2["_sort"] = pd.to_datetime(sort_df2["Fecha"], errors="coerce")
+    df_show = sort_df2.sort_values("_sort", ascending=False)
+    
     if df_show.empty:
         st.markdown("<div class='empty'><big>📋</big>Nada cargado todavía.</div>", unsafe_allow_html=True)
     else:
@@ -909,33 +921,31 @@ with tabs[1]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — TARJETAS (Editor blindado contra desincronización)
+# TAB 2 — TARJETAS (Editor blindado total)
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[2]:
     tarjetas_df = load("tarjetas").reset_index(drop=True)
 
     st.markdown("<div class='sec'>Configuración de tarjetas</div>", unsafe_allow_html=True)
-    if not tarjetas_df.empty:
-        with st.form("form_editar_tarjetas"):
-            st.caption("Modificá la configuración y presioná Guardar.")
-            edited_t = st.data_editor(
-                tarjetas_df,
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "Nombre":           st.column_config.TextColumn("Nombre", width="medium"),
-                    "Dia cierre":       st.column_config.NumberColumn("Cierra", min_value=1, max_value=28),
-                    "Dia vencimiento":  st.column_config.NumberColumn("Vence", min_value=1, max_value=31),
-                    "Color":            st.column_config.SelectboxColumn("Color", options=COLORES_TARJETA),
-                },
-                key="editor_tarjetas"
-            )
-            if st.form_submit_button("Guardar cambios en tarjetas"):
-                save("tarjetas", edited_t)
-                st.success("Configuración guardada.")
-                st.rerun()
-    else:
-        st.markdown("<div class='empty'><big>💳</big>No hay tarjetas. Usá + Agregar para crear la primera.</div>", unsafe_allow_html=True)
+    st.info("💡 Editá la configuración acá y luego presioná **Guardar cambios**.")
+    
+    # Mantenemos las tarjetas en editor sin form para que sea responsivo rápido
+    edited_t = st.data_editor(
+        tarjetas_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "Nombre":           st.column_config.TextColumn("Nombre", width="medium"),
+            "Dia cierre":       st.column_config.NumberColumn("Cierra", min_value=1, max_value=28),
+            "Dia vencimiento":  st.column_config.NumberColumn("Vence", min_value=1, max_value=31),
+            "Color":            st.column_config.SelectboxColumn("Color", options=COLORES_TARJETA),
+        },
+        key="editor_tarjetas"
+    )
+    if st.button("💾 Guardar cambios en tarjetas", type="primary", use_container_width=True):
+        save("tarjetas", edited_t)
+        st.success("Configuración guardada.")
+        st.rerun()
 
     st.markdown("<div class='sec'>Gastos por tarjeta y período</div>", unsafe_allow_html=True)
 
@@ -981,8 +991,14 @@ with tabs[2]:
     if not df_per.empty:
         df_per_ed = df_per.copy()
         df_per_ed["_idx"] = df_per_ed.index
-        if "_sort_date" in df_per_ed.columns:
-            df_per_ed = df_per_ed.drop(columns=["_sort_date"])
+        
+        # Parseamos la fecha para que Streamlit Data Editor entienda que es una fecha Python nativa
+        def force_date(x):
+            try:
+                return pd.to_datetime(x).date() if str(x) != "S/F" else None
+            except:
+                return None
+        df_per_ed["Fecha"] = df_per_ed["Fecha"].apply(force_date)
 
         df_per_ed["Monto"]           = pd.to_numeric(df_per_ed["Monto"], errors="coerce").fillna(0)
         df_per_ed["Cuotas"]          = pd.to_numeric(df_per_ed["Cuotas"], errors="coerce").fillna(1).astype(int)
@@ -993,43 +1009,42 @@ with tabs[2]:
         df_per_ed["Concepto"]        = df_per_ed["Concepto"].fillna("").astype(str)
         df_per_ed["Categoria"]       = df_per_ed["Categoria"].fillna("💳 Otro").astype(str)
         df_per_ed["Tarjeta"]         = df_per_ed["Tarjeta"].fillna("").astype(str)
-        df_per_ed["Fecha"]           = pd.to_datetime(df_per_ed["Fecha"], errors="coerce", dayfirst=True).dt.date
 
-        # ¡CLAVE! Formulario blindado para la tabla dinámica
-        with st.form(f"form_editor_{t_sel}_{sel_py}_{sel_pm}"):
-            st.caption("Cualquier celda es editable. Al terminar, presioná Guardar para enviar a la base de datos.")
-            edited_per = st.data_editor(
-                df_per_ed.drop(columns=["_idx"]),
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "Fecha":           st.column_config.DateColumn("Fecha"),
-                    "Concepto":        st.column_config.TextColumn("Concepto"),
-                    "Monto":           st.column_config.NumberColumn("Monto $", format="$%d", min_value=0),
-                    "Cuotas":          st.column_config.NumberColumn("Cuotas", min_value=1, max_value=48, step=1),
-                    "Compartido":      st.column_config.TextColumn("Compartido"),
-                    "Con quien":       st.column_config.TextColumn("Con quién"),
-                    "Cuanto recupero": st.column_config.NumberColumn("Recupero $", format="$%d", min_value=0),
-                    "Notas":           st.column_config.TextColumn("Notas"),
-                    "Tarjeta":         st.column_config.TextColumn("Tarjeta"),
-                    "Categoria":       st.column_config.TextColumn("Categoría"),
-                },
-                key=f"editor_gastos_{t_sel}_{sel_py}_{sel_pm}"
-            )
+        st.caption("Cualquier celda es editable. Asegurate de hacer click afuera de la celda al terminar, y luego presioná **Guardar cambios**.")
+        
+        # SACAMOS EL st.form DEL EDITOR. Esto arregla los bugs de guardar datos por la mitad.
+        edited_per = st.data_editor(
+            df_per_ed.drop(columns=["_idx"]),
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "Fecha":           st.column_config.DateColumn("Fecha"),
+                "Concepto":        st.column_config.TextColumn("Concepto"),
+                "Monto":           st.column_config.NumberColumn("Monto $", format="$%d", min_value=0),
+                "Cuotas":          st.column_config.NumberColumn("Cuotas", min_value=1, max_value=48, step=1),
+                "Compartido":      st.column_config.TextColumn("Compartido"),
+                "Con quien":       st.column_config.TextColumn("Con quién"),
+                "Cuanto recupero": st.column_config.NumberColumn("Recupero $", format="$%d", min_value=0),
+                "Notas":           st.column_config.TextColumn("Notas"),
+                "Tarjeta":         st.column_config.TextColumn("Tarjeta"),
+                "Categoria":       st.column_config.TextColumn("Categoría"),
+            },
+            key=f"editor_gastos_{t_sel}_{sel_py}_{sel_pm}"
+        )
+        
+        # Botón por fuera, capta 100% de los cambios del cache
+        if st.button("💾 Guardar cambios en gastos", type="primary", use_container_width=True):
+            orig_indices = df_per_ed["_idx"].tolist()
+            valid_indices = [i for i in orig_indices if i in gastos_df.index]
+            gastos_df_limpio = gastos_df.drop(index=valid_indices)
             
-            if st.form_submit_button("💾 Guardar cambios en gastos"):
-                # Capturamos los índices que existían ANTES de la edición para pisarlos
-                orig_indices = df_per_ed["_idx"].tolist()
-                valid_indices = [i for i in orig_indices if i in gastos_df.index]
-                
-                # Borramos esos índices viejos
-                gastos_df_limpio = gastos_df.drop(index=valid_indices)
-                
-                # Pegamos lo nuevo editado
-                gastos_df_final = pd.concat([gastos_df_limpio, edited_per], ignore_index=True)
-                save("gastos", gastos_df_final)
-                st.success("¡Base de datos actualizada con éxito!")
-                st.rerun()
+            # Volvemos a convertir a string formato ISO impecable
+            edited_per["Fecha"] = pd.to_datetime(edited_per["Fecha"]).dt.strftime("%Y-%m-%d").fillna("S/F")
+            
+            gastos_df_final = pd.concat([gastos_df_limpio, edited_per], ignore_index=True)
+            save("gastos", gastos_df_final)
+            st.success("¡Base de datos actualizada con éxito!")
+            st.rerun()
     else:
         st.markdown("<div class='empty'><big>💳</big>Sin gastos en este período.</div>", unsafe_allow_html=True)
 
