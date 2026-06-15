@@ -35,9 +35,10 @@ def load(key):
 
 def save(key, df):
     f, _ = FILES[key]
-    # Limpiamos la columna de ordenamiento temporal antes de guardar si existe
-    if "_sort_date" in df.columns:
-        df = df.drop(columns=["_sort_date"])
+    # Limpiamos variables temporales de memoria antes de guardar
+    cols_to_drop = [c for c in ["_sort_date", "_idx"] if c in df.columns]
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop)
     df.to_csv(f, index=False)
 
 def to_num(s):
@@ -71,14 +72,23 @@ def safe_int(val, default=1):
         return default
 
 def get_tarjetas_nombres():
+    """Lee las tarjetas configuradas y además escanea los gastos para detectar tarjetas importadas por CSV"""
     t_df = load("tarjetas")
-    if not t_df.empty:
-        nombres = t_df["Nombre"].dropna().tolist()
-        for d in TARJETAS_DEFAULT:
-            if d not in nombres:
-                nombres.append(d)
-        return nombres
-    return TARJETAS_DEFAULT
+    nombres = t_df["Nombre"].dropna().tolist() if not t_df.empty else []
+    
+    # Agregar las default
+    for d in TARJETAS_DEFAULT:
+        if d not in nombres: nombres.append(d)
+        
+    # Escaneo inteligente: si importaste un CSV con una tarjeta nueva, aparece automáticamente
+    g_df = load("gastos")
+    if not g_df.empty and "Tarjeta" in g_df.columns:
+        for t in g_df["Tarjeta"].dropna().unique():
+            t_str = str(t).strip()
+            if t_str and t_str not in nombres:
+                nombres.append(t_str)
+                
+    return nombres
 
 def get_periodo_tarjeta(tarjeta_nombre, año=None, mes=None):
     t_df = load("tarjetas")
@@ -536,19 +546,20 @@ if "gasto_limit" not in st.session_state: st.session_state.gasto_limit = 30
 if "menu_accion" not in st.session_state: st.session_state.menu_accion = False
 if "tipo_accion" not in st.session_state: st.session_state.tipo_accion = "Gasto"
 
-gastos_df   = load("gastos")
-ingresos_df = load("ingresos")
-comp_df     = load("compartidos")
-inv_df      = load("inversiones")
-pres_df     = load("presupuesto")
-tarjetas_df = load("tarjetas")
+# Se carga con reset de index estricto para evitar corrupciones de memoria
+gastos_df   = load("gastos").reset_index(drop=True)
+ingresos_df = load("ingresos").reset_index(drop=True)
+comp_df     = load("compartidos").reset_index(drop=True)
+inv_df      = load("inversiones").reset_index(drop=True)
+pres_df     = load("presupuesto").reset_index(drop=True)
+tarjetas_df = load("tarjetas").reset_index(drop=True)
 
 for col in ["Monto","Cuanto recupero"]:
     gastos_df[col] = to_num(gastos_df[col])
 ingresos_df["Monto"] = to_num(ingresos_df["Monto"])
 comp_df["Monto"]     = to_num(comp_df["Monto"])
 
-# Columna temporal para ordenar fechas rigurosamente sin romper el CSV
+# Ordenamiento temporal blindado
 gastos_df["_sort_date"] = pd.to_datetime(gastos_df["Fecha"], errors="coerce", dayfirst=True)
 
 y, m = mes_actual()
@@ -605,7 +616,7 @@ if st.session_state.menu_accion:
             ca, cb = st.columns([3,1])
             if ca.form_submit_button("Guardar gasto"):
                 if q_c.strip() and q_m > 0:
-                    nv = pd.DataFrame([[str(q_f),q_c.strip(),q_m,q_t,q_cu,q_k,"No","",0,""]], columns=["Fecha","Concepto","Monto","Tarjeta","Cuotas","Categoria","Compartido","Con quien","Cuanto recupero","Notas"])
+                    nv = pd.DataFrame([[str(q_f),q_c.strip(),q_m,q_t,q_cu,q_k,"No","",0,""]], columns=FILES["gastos"][1])
                     gastos_df = pd.concat([gastos_df,nv], ignore_index=True)
                     save("gastos", gastos_df)
                     st.session_state.menu_accion = False
@@ -691,7 +702,6 @@ with tabs[0]:
         {"<div class='stat-cell'><div class='stat-label'>Recuperás</div><div class='stat-val c-yel'>" + fmt_ars(recupero) + "</div></div>" if recupero > 0 else ""}
     </div>""", unsafe_allow_html=True)
 
-    # ── FIX: Mostrar Total Acumulado Histórico por Tarjeta ──
     st.markdown("<div class='sec'>Total Acumulado por Tarjeta</div>", unsafe_allow_html=True)
     tarjetas_con_gasto = {}
     for tname in TARJETAS:
@@ -740,7 +750,6 @@ with tabs[0]:
                 unsafe_allow_html=True
             )
 
-    # ── FIX: Movimientos ordenados bien por la fecha ──
     st.markdown("<div class='sec'>Últimos movimientos</div>", unsafe_allow_html=True)
     recientes = gastos_df.sort_values("_sort_date", ascending=False).head(6)
     if recientes.empty:
@@ -803,7 +812,7 @@ with tabs[1]:
             if csv_text.strip():
                 try:
                     nuevos = pd.read_csv(io.StringIO(csv_text.strip()))
-                    columnas_necesarias = ["Fecha","Concepto","Monto","Tarjeta","Cuotas","Categoria","Compartido","Con quien","Cuanto recupero","Notas"]
+                    columnas_necesarias = FILES["gastos"][1]
                     for col in columnas_necesarias:
                         if col not in nuevos.columns:
                             nuevos[col] = 0 if col in ["Monto","Cuanto recupero"] else ("No" if col=="Compartido" else "")
@@ -835,7 +844,7 @@ with tabs[1]:
             g_nota = st.text_input("Nota", placeholder="Opcional")
             if st.form_submit_button("Guardar gasto"):
                 if g_c.strip() and g_m > 0:
-                    nv = pd.DataFrame([[str(g_f),g_c.strip(),g_m,g_t,g_cu,g_k,g_comp,g_quien,g_rec,g_nota]], columns=["Fecha","Concepto","Monto","Tarjeta","Cuotas","Categoria","Compartido","Con quien","Cuanto recupero","Notas"])
+                    nv = pd.DataFrame([[str(g_f),g_c.strip(),g_m,g_t,g_cu,g_k,g_comp,g_quien,g_rec,g_nota]], columns=FILES["gastos"][1])
                     gastos_df = pd.concat([gastos_df,nv], ignore_index=True)
                     save("gastos", gastos_df)
                     if g_comp == "Sí" and g_rec > 0:
@@ -900,29 +909,31 @@ with tabs[1]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — TARJETAS
+# TAB 2 — TARJETAS (Editor blindado contra desincronización)
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[2]:
-    tarjetas_df = load("tarjetas")
+    tarjetas_df = load("tarjetas").reset_index(drop=True)
 
     st.markdown("<div class='sec'>Configuración de tarjetas</div>", unsafe_allow_html=True)
     if not tarjetas_df.empty:
-        edited_t = st.data_editor(
-            tarjetas_df,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "Nombre":           st.column_config.TextColumn("Nombre", width="medium"),
-                "Dia cierre":       st.column_config.NumberColumn("Cierra", min_value=1, max_value=28),
-                "Dia vencimiento":  st.column_config.NumberColumn("Vence", min_value=1, max_value=31),
-                "Color":            st.column_config.SelectboxColumn("Color", options=COLORES_TARJETA),
-            },
-            key="editor_tarjetas"
-        )
-        if st.button("Guardar cambios en tarjetas", key="save_t"):
-            save("tarjetas", edited_t)
-            st.success("Configuración guardada.")
-            st.rerun()
+        with st.form("form_editar_tarjetas"):
+            st.caption("Modificá la configuración y presioná Guardar.")
+            edited_t = st.data_editor(
+                tarjetas_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "Nombre":           st.column_config.TextColumn("Nombre", width="medium"),
+                    "Dia cierre":       st.column_config.NumberColumn("Cierra", min_value=1, max_value=28),
+                    "Dia vencimiento":  st.column_config.NumberColumn("Vence", min_value=1, max_value=31),
+                    "Color":            st.column_config.SelectboxColumn("Color", options=COLORES_TARJETA),
+                },
+                key="editor_tarjetas"
+            )
+            if st.form_submit_button("Guardar cambios en tarjetas"):
+                save("tarjetas", edited_t)
+                st.success("Configuración guardada.")
+                st.rerun()
     else:
         st.markdown("<div class='empty'><big>💳</big>No hay tarjetas. Usá + Agregar para crear la primera.</div>", unsafe_allow_html=True)
 
@@ -984,31 +995,41 @@ with tabs[2]:
         df_per_ed["Tarjeta"]         = df_per_ed["Tarjeta"].fillna("").astype(str)
         df_per_ed["Fecha"]           = pd.to_datetime(df_per_ed["Fecha"], errors="coerce", dayfirst=True).dt.date
 
-        edited_per = st.data_editor(
-            df_per_ed.drop(columns=["_idx"]),
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "Fecha":           st.column_config.DateColumn("Fecha"),
-                "Concepto":        st.column_config.TextColumn("Concepto"),
-                "Monto":           st.column_config.NumberColumn("Monto $", format="$%d", min_value=0),
-                "Cuotas":          st.column_config.NumberColumn("Cuotas", min_value=1, max_value=48, step=1),
-                "Compartido":      st.column_config.TextColumn("Compartido"),
-                "Con quien":       st.column_config.TextColumn("Con quién"),
-                "Cuanto recupero": st.column_config.NumberColumn("Recupero $", format="$%d", min_value=0),
-                "Notas":           st.column_config.TextColumn("Notas"),
-                "Tarjeta":         st.column_config.TextColumn("Tarjeta"),
-                "Categoria":       st.column_config.TextColumn("Categoría"),
-            },
-            key=f"editor_gastos_{t_sel}_{sel_py}_{sel_pm}"
-        )
-        if st.button("Guardar cambios en gastos", key="save_per"):
-            orig_indices = df_per_ed["_idx"].tolist()
-            gastos_df = gastos_df.drop(index=[i for i in orig_indices if i in gastos_df.index])
-            gastos_df = pd.concat([gastos_df, edited_per], ignore_index=True)
-            save("gastos", gastos_df)
-            st.success("Gastos actualizados.")
-            st.rerun()
+        # ¡CLAVE! Formulario blindado para la tabla dinámica
+        with st.form(f"form_editor_{t_sel}_{sel_py}_{sel_pm}"):
+            st.caption("Cualquier celda es editable. Al terminar, presioná Guardar para enviar a la base de datos.")
+            edited_per = st.data_editor(
+                df_per_ed.drop(columns=["_idx"]),
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "Fecha":           st.column_config.DateColumn("Fecha"),
+                    "Concepto":        st.column_config.TextColumn("Concepto"),
+                    "Monto":           st.column_config.NumberColumn("Monto $", format="$%d", min_value=0),
+                    "Cuotas":          st.column_config.NumberColumn("Cuotas", min_value=1, max_value=48, step=1),
+                    "Compartido":      st.column_config.TextColumn("Compartido"),
+                    "Con quien":       st.column_config.TextColumn("Con quién"),
+                    "Cuanto recupero": st.column_config.NumberColumn("Recupero $", format="$%d", min_value=0),
+                    "Notas":           st.column_config.TextColumn("Notas"),
+                    "Tarjeta":         st.column_config.TextColumn("Tarjeta"),
+                    "Categoria":       st.column_config.TextColumn("Categoría"),
+                },
+                key=f"editor_gastos_{t_sel}_{sel_py}_{sel_pm}"
+            )
+            
+            if st.form_submit_button("💾 Guardar cambios en gastos"):
+                # Capturamos los índices que existían ANTES de la edición para pisarlos
+                orig_indices = df_per_ed["_idx"].tolist()
+                valid_indices = [i for i in orig_indices if i in gastos_df.index]
+                
+                # Borramos esos índices viejos
+                gastos_df_limpio = gastos_df.drop(index=valid_indices)
+                
+                # Pegamos lo nuevo editado
+                gastos_df_final = pd.concat([gastos_df_limpio, edited_per], ignore_index=True)
+                save("gastos", gastos_df_final)
+                st.success("¡Base de datos actualizada con éxito!")
+                st.rerun()
     else:
         st.markdown("<div class='empty'><big>💳</big>Sin gastos en este período.</div>", unsafe_allow_html=True)
 
@@ -1096,7 +1117,7 @@ with tabs[4]:
             else:
                 st.warning("Completá todos los campos.")
 
-    comp_df = load("compartidos"); comp_df["Monto"] = to_num(comp_df["Monto"])
+    comp_df = load("compartidos").reset_index(drop=True); comp_df["Monto"] = to_num(comp_df["Monto"])
     pends = comp_df[comp_df["Estado"] == "Pendiente"].sort_values("Fecha", ascending=False)
     cobs  = comp_df[comp_df["Estado"] != "Pendiente"].sort_values("Fecha", ascending=False)
 
@@ -1171,7 +1192,7 @@ with tabs[5]:
             else:
                 st.warning("Nombre y capital requeridos.")
 
-    inv_df = load("inversiones")
+    inv_df = load("inversiones").reset_index(drop=True)
     inv_df["Capital"] = to_num(inv_df.get("Capital", pd.Series()))
     inv_df["Rendimiento"] = to_num(inv_df.get("Rendimiento", pd.Series()))
 
