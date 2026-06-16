@@ -261,10 +261,12 @@ nombre_mes = calendar.month_name[m].capitalize()
 
 # BUG 5 FIX: ordenar por fecha correctamente desde el inicio
 def sort_by_fecha(df):
+    """Ordena por fecha desc. Los None/NaT (sin fecha) van siempre al fondo."""
     if df.empty: return df
     df = df.copy()
     df["_sort"] = pd.to_datetime(df["Fecha"], errors="coerce")
-    df = df.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+    # na_position="last": filas sin fecha van al fondo, no al tope
+    df = df.sort_values("_sort", ascending=False, na_position="last").drop(columns=["_sort"])
     return df
 
 gastos_df   = sort_by_fecha(gastos_df)
@@ -674,26 +676,24 @@ with tabs[2]:
         "</div>", unsafe_allow_html=True)
 
     if not df_per.empty:
-        # BUG 4 FIX: guardar índices originales para reemplazar solo esas filas
-        df_per_ed = df_per.copy()
-        df_per_ed["_orig_idx"] = list(range(len(df_per_ed)))  # índice posicional relativo
-        indices_originales = list(df_per.index)  # índices del df global
+        # Preparar df para el editor — limpiar tipos
+        df_ed = df_per.copy().reset_index(drop=True)
+        # Guardar clave de identificación: concepto + tarjeta originales para buscarlos al guardar
+        claves_orig = list(zip(df_ed["Concepto"].astype(str), df_ed["Tarjeta"].astype(str), df_ed["Monto"].astype(str)))
 
-        # Limpiar tipos estrictamente
-        df_per_ed["Fecha"]           = df_per_ed["Fecha"].apply(lambda x: pd.to_datetime(x, errors="coerce").date() if str(x) not in ("S/F","","nan") else None)
-        df_per_ed["Monto"]           = pd.to_numeric(df_per_ed["Monto"], errors="coerce").fillna(0)
-        df_per_ed["Cuotas"]          = pd.to_numeric(df_per_ed["Cuotas"], errors="coerce").fillna(1).astype(int)
-        df_per_ed["Cuanto recupero"] = pd.to_numeric(df_per_ed["Cuanto recupero"], errors="coerce").fillna(0)
-        # BUG 7 FIX: strings explícitos para campos de texto
-        df_per_ed["Concepto"]   = df_per_ed["Concepto"].fillna("").astype(str)
-        df_per_ed["Tarjeta"]    = df_per_ed["Tarjeta"].fillna("").astype(str)
-        df_per_ed["Categoria"]  = df_per_ed["Categoria"].fillna("💳 Otro").astype(str)
-        df_per_ed["Compartido"] = df_per_ed["Compartido"].fillna("No").astype(str)
-        df_per_ed["Con quien"]  = df_per_ed["Con quien"].fillna("").astype(str)
-        df_per_ed["Notas"]      = df_per_ed["Notas"].fillna("").astype(str)
+        df_ed["Fecha"]           = df_ed["Fecha"].apply(lambda x: pd.to_datetime(x, errors="coerce").date() if str(x) not in ("S/F","","nan") else None)
+        df_ed["Monto"]           = pd.to_numeric(df_ed["Monto"], errors="coerce").fillna(0)
+        df_ed["Cuotas"]          = pd.to_numeric(df_ed["Cuotas"], errors="coerce").fillna(1).astype(int)
+        df_ed["Cuanto recupero"] = pd.to_numeric(df_ed["Cuanto recupero"], errors="coerce").fillna(0)
+        df_ed["Concepto"]        = df_ed["Concepto"].fillna("").astype(str)
+        df_ed["Tarjeta"]         = df_ed["Tarjeta"].fillna("").astype(str)
+        df_ed["Categoria"]       = df_ed["Categoria"].fillna("💳 Otro").astype(str)
+        df_ed["Compartido"]      = df_ed["Compartido"].fillna("No").astype(str)
+        df_ed["Con quien"]       = df_ed["Con quien"].fillna("").astype(str)
+        df_ed["Notas"]           = df_ed["Notas"].fillna("").astype(str)
 
         edited_per = st.data_editor(
-            df_per_ed.drop(columns=["_orig_idx"]),
+            df_ed,
             num_rows="dynamic",
             use_container_width=True,
             column_config={
@@ -710,19 +710,37 @@ with tabs[2]:
             },
             key=f"editor_per_{t_sel}_{sel_py}_{sel_pm}"
         )
+
         if st.button("💾 Guardar cambios en gastos", key="save_per"):
-            # BUG 4 FIX: quitar solo las filas que editamos, no todo el df
-            gastos_limpio = gastos_df.drop(index=indices_originales).reset_index(drop=True)
-            # Convertir fecha de date object a string
-            edited_per2 = edited_per.copy()
-            edited_per2["Fecha"] = edited_per2["Fecha"].apply(fmt_fecha)
-            # Asegurar que todos los campos numéricos estén bien
-            edited_per2["Monto"]           = to_num(edited_per2["Monto"])
-            edited_per2["Cuanto recupero"] = to_num(edited_per2["Cuanto recupero"])
-            gastos_final = pd.concat([gastos_limpio, edited_per2], ignore_index=True)
-            gastos_final = sort_by_fecha(gastos_final)
-            save("gastos", gastos_final)
-            st.success("Gastos actualizados.")
+            # LEER SIEMPRE DEL DISCO — nunca confiar en gastos_df de memoria
+            base = load("gastos")
+            base["Monto"]           = to_num(base["Monto"])
+            base["Cuanto recupero"] = to_num(base["Cuanto recupero"])
+
+            # Eliminar del CSV las filas que coinciden con las claves originales
+            # Usamos máscara booleana: fila a eliminar = concepto+tarjeta+monto coinciden con alguna clave original
+            def es_fila_original(row):
+                k = (str(row["Concepto"]), str(row["Tarjeta"]), str(row["Monto"]))
+                return k in claves_orig
+
+            mascara_eliminar = base.apply(es_fila_original, axis=1)
+            base_limpia = base[~mascara_eliminar].reset_index(drop=True)
+
+            # Preparar filas editadas
+            nuevas = edited_per.copy()
+            nuevas["Fecha"]           = nuevas["Fecha"].apply(fmt_fecha)
+            nuevas["Monto"]           = to_num(nuevas["Monto"])
+            nuevas["Cuanto recupero"] = to_num(nuevas["Cuanto recupero"])
+            # Asegurar que tiene todas las columnas
+            for col in FILES["gastos"][1]:
+                if col not in nuevas.columns:
+                    nuevas[col] = ""
+            nuevas = nuevas[FILES["gastos"][1]]
+
+            final = pd.concat([base_limpia, nuevas], ignore_index=True)
+            final = sort_by_fecha(final)
+            save("gastos", final)
+            st.success(f"✅ Guardado. {len(nuevas)} filas en este período.")
             st.rerun()
     else:
         st.markdown("<div class='empty'><big>💳</big>Sin gastos en este período.</div>", unsafe_allow_html=True)
