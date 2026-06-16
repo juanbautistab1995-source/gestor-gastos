@@ -406,6 +406,11 @@ with tabs[0]:
         f"{recup_cell}"
         "</div>", unsafe_allow_html=True)
 
+    # Recargar del disco una sola vez para toda la sección home
+    gastos_fresh = load("gastos")
+    gastos_fresh["Monto"] = to_num(gastos_fresh["Monto"])
+    gastos_fresh = sort_by_fecha(gastos_fresh)
+
     # Resumen tarjetas — mes calendario, datos frescos del disco
     st.markdown("<div class='sec'>Esta quincena / período</div>", unsafe_allow_html=True)
     gastos_mes_fresh = filtrar_mes(gastos_fresh, y, m)
@@ -437,11 +442,8 @@ with tabs[0]:
     else:
         st.markdown("<div class='empty'><big>💸</big>Sin gastos este mes.</div>", unsafe_allow_html=True)
 
-    # Últimos movimientos — recargar del disco para ver gastos recién agregados
+    # Últimos movimientos
     st.markdown("<div class='sec'>Últimos movimientos</div>", unsafe_allow_html=True)
-    gastos_fresh = load("gastos")
-    gastos_fresh["Monto"] = to_num(gastos_fresh["Monto"])
-    gastos_fresh = sort_by_fecha(gastos_fresh)
     recientes = gastos_fresh.head(8)
     if recientes.empty:
         st.markdown("<div class='empty'><big>📋</big>Sin movimientos todavía.</div>", unsafe_allow_html=True)
