@@ -25,15 +25,20 @@ TARJETAS_DEFAULT = ["Visa ICBC","Visa Hipotecario","Master ICBC","Efectivo","Dé
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def fmt_fecha(d):
-    """Convierte cualquier cosa a string YYYY-MM-DD limpio. Nunca falla."""
+    """Convierte cualquier cosa a string YYYY-MM-DD. Nunca falla, nunca NaT."""
+    # NaT de pandas — isinstance no lo captura con date/datetime
+    try:
+        if pd.isnull(d):
+            return str(date.today())
+    except (TypeError, ValueError):
+        pass
     if d is None:
         return str(date.today())
     if isinstance(d, (date, datetime)):
         return d.strftime("%Y-%m-%d")
     s = str(d).strip()
-    if not s or s.lower() in ("nat", "nan", "none", "s/f", ""):
+    if not s or s.lower() in ("nat", "nan", "none", "s/f", "", "pd.nat"):
         return str(date.today())
-    # Intentar parsear
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
         try:
             return datetime.strptime(s[:10], fmt).strftime("%Y-%m-%d")
@@ -401,11 +406,12 @@ with tabs[0]:
         f"{recup_cell}"
         "</div>", unsafe_allow_html=True)
 
-    # Resumen tarjetas — mes calendario (sin lógica de período para el home, más claro)
+    # Resumen tarjetas — mes calendario, datos frescos del disco
     st.markdown("<div class='sec'>Esta quincena / período</div>", unsafe_allow_html=True)
+    gastos_mes_fresh = filtrar_mes(gastos_fresh, y, m)
     tarjetas_con_gasto = {}
     for tname in TARJETAS:
-        gf = gastos_mes[gastos_mes["Tarjeta"] == tname]
+        gf = gastos_mes_fresh[gastos_mes_fresh["Tarjeta"] == tname]
         total_t = gf["Monto"].sum() if not gf.empty else 0
         if total_t > 0:
             tarjetas_con_gasto[tname] = total_t
@@ -431,24 +437,12 @@ with tabs[0]:
     else:
         st.markdown("<div class='empty'><big>💸</big>Sin gastos este mes.</div>", unsafe_allow_html=True)
 
-    # Categorías del mes
-    if not gastos_mes.empty:
-        st.markdown("<div class='sec'>Por categoría</div>", unsafe_allow_html=True)
-        cat_sum = gastos_mes.groupby("Categoria")["Monto"].sum().sort_values(ascending=False).head(6)
-        max_c = cat_sum.max() if cat_sum.max() > 0 else 1
-        pal = ["#6c63ff","#39e07a","#ff5f7e","#f5c542","#60a5fa","#f472b6"]
-        for i, (cat, val) in enumerate(cat_sum.items()):
-            pct = int(val / max_c * 100)
-            fill = f"<div class='prog-fill' style='width:{pct}%;background:{pal[i%len(pal)]}'></div>"
-            st.markdown(
-                "<div class='prog-wrap'>"
-                f"<div class='prog-head'><span>{cat}</span><span>{fmt_ars(val)}</span></div>"
-                f"<div class='prog-bg'>{fill}</div>"
-                "</div>", unsafe_allow_html=True)
-
-    # Últimos movimientos — BUG 5 FIX: ya ordenado en la carga
+    # Últimos movimientos — recargar del disco para ver gastos recién agregados
     st.markdown("<div class='sec'>Últimos movimientos</div>", unsafe_allow_html=True)
-    recientes = gastos_df.head(8)
+    gastos_fresh = load("gastos")
+    gastos_fresh["Monto"] = to_num(gastos_fresh["Monto"])
+    gastos_fresh = sort_by_fecha(gastos_fresh)
+    recientes = gastos_fresh.head(8)
     if recientes.empty:
         st.markdown("<div class='empty'><big>📋</big>Sin movimientos todavía.</div>", unsafe_allow_html=True)
     else:
@@ -612,33 +606,33 @@ with tabs[2]:
 
     st.markdown("<div class='sec'>Configuración de tarjetas</div>", unsafe_allow_html=True)
 
+    # ABM siempre visible, incluso si está vacío (se puede agregar con num_rows="dynamic")
     if tarjetas_df.empty:
-        st.markdown("<div class='empty'><big>💳</big>No hay tarjetas. Usá + Agregar para crear la primera.</div>", unsafe_allow_html=True)
+        tarjetas_edit = pd.DataFrame(columns=["Nombre","Dia cierre","Dia vencimiento","Color"])
     else:
-        # BUG 4 FIX: tipos explícitos para el editor, sin SelectboxColumn en Color para evitar corrupción
         tarjetas_edit = tarjetas_df.copy()
-        tarjetas_edit["Dia cierre"]      = pd.to_numeric(tarjetas_edit["Dia cierre"], errors="coerce").fillna(5).astype(int)
-        tarjetas_edit["Dia vencimiento"] = pd.to_numeric(tarjetas_edit["Dia vencimiento"], errors="coerce").fillna(20).astype(int)
-        tarjetas_edit["Nombre"]          = tarjetas_edit["Nombre"].astype(str)
-        tarjetas_edit["Color"]           = tarjetas_edit["Color"].astype(str)
+    tarjetas_edit["Dia cierre"]      = pd.to_numeric(tarjetas_edit["Dia cierre"], errors="coerce").fillna(5).astype(int)
+    tarjetas_edit["Dia vencimiento"] = pd.to_numeric(tarjetas_edit["Dia vencimiento"], errors="coerce").fillna(20).astype(int)
+    tarjetas_edit["Nombre"]          = tarjetas_edit["Nombre"].fillna("").astype(str)
+    tarjetas_edit["Color"]           = tarjetas_edit["Color"].fillna("#7c6af7").astype(str)
 
-        edited_t = st.data_editor(
-            tarjetas_edit,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "Nombre":          st.column_config.TextColumn("Nombre"),
-                "Dia cierre":      st.column_config.NumberColumn("Día cierre", min_value=1, max_value=28, step=1),
-                "Dia vencimiento": st.column_config.NumberColumn("Día vence", min_value=1, max_value=31, step=1),
-                "Color":           st.column_config.TextColumn("Color (hex)"),
-            },
-            key="editor_tarjetas"
-        )
-        if st.button("💾 Guardar tarjetas", key="save_t"):
-            # BUG 4 FIX: guardar SOLO el df de tarjetas, no tocar gastos
-            save("tarjetas", edited_t)
-            st.success("Configuración guardada.")
-            st.rerun()
+    st.markdown("<div class='info-strip'>Editá o agregá filas acá. Los colores van en hex (#7c6af7). Luego guardá.</div>", unsafe_allow_html=True)
+    edited_t = st.data_editor(
+        tarjetas_edit,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "Nombre":          st.column_config.TextColumn("Nombre"),
+            "Dia cierre":      st.column_config.NumberColumn("Día cierre", min_value=1, max_value=28, step=1),
+            "Dia vencimiento": st.column_config.NumberColumn("Día vence", min_value=1, max_value=31, step=1),
+            "Color":           st.column_config.SelectboxColumn("Color", options=["#7c6af7","#4ade80","#f87171","#fbbf24","#60a5fa","#f472b6","#34d399","#fb923c"]),
+        },
+        key="editor_tarjetas"
+    )
+    if st.button("💾 Guardar tarjetas", key="save_t"):
+        save("tarjetas", edited_t.dropna(subset=["Nombre"]).reset_index(drop=True))
+        st.success("Configuración guardada.")
+        st.rerun()
 
     st.markdown("<div class='sec'>Gastos por tarjeta y período</div>", unsafe_allow_html=True)
     c1,c2 = st.columns(2)
