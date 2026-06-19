@@ -199,6 +199,40 @@ def get_color_tarjeta(tname, tarjetas_df):
     idx = TARJETAS_DEFAULT.index(tname) if tname in TARJETAS_DEFAULT else 0
     return COLORES_TARJETA[idx % len(COLORES_TARJETA)]
 
+# ── Importación de movimientos desde texto/CSV pegado ──────────────────────────
+def es_duplicado(fecha_str, concepto, monto, tarjeta, gastos_existentes):
+    """Chequea si un movimiento ya existe en la base.
+    Compara Concepto (normalizado) + Monto (tolerancia $1) + Tarjeta.
+    Si las fechas coinciden, suma certeza; si una de las dos no tiene fecha, no descarta."""
+    if gastos_existentes.empty:
+        return False
+    concepto_norm = str(concepto).strip().lower()
+    tarjeta_norm  = str(tarjeta).strip().lower()
+    fecha_norm    = str(fecha_str).strip()
+    try:
+        monto_f = float(monto)
+    except (ValueError, TypeError):
+        return False
+
+    candidatos = gastos_existentes[
+        (gastos_existentes["Concepto"].astype(str).str.strip().str.lower() == concepto_norm) &
+        (gastos_existentes["Tarjeta"].astype(str).str.strip().str.lower() == tarjeta_norm)
+    ]
+    if candidatos.empty:
+        return False
+
+    for _, r in candidatos.iterrows():
+        try:
+            monto_existente = float(r.get("Monto", 0))
+        except (ValueError, TypeError):
+            continue
+        if abs(monto_existente - monto_f) < 1.0:
+            fecha_existente = str(r.get("Fecha","")).strip()
+            # Si ambas fechas existen y coinciden, o si alguna falta -> es duplicado
+            if not fecha_existente or not fecha_norm or fecha_existente == fecha_norm:
+                return True
+    return False
+
 # ── CSS ────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Biyuyo", layout="centered", initial_sidebar_state="collapsed")
 
@@ -540,28 +574,81 @@ with tabs[0]:
 # TAB 1 — GASTOS
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[1]:
-    with st.expander("📥 Importar desde CSV"):
-        st.markdown("<div class='info-strip'>Pegá el texto CSV. Las columnas que falten se completan solas.</div>", unsafe_allow_html=True)
-        csv_text = st.text_area("", placeholder="Fecha,Concepto,Monto,Tarjeta...", height=120, label_visibility="collapsed")
-        if st.button("Importar gastos", key="import_csv"):
+    with st.expander("📥 Importar desde CSV / foto de resumen"):
+        st.markdown(
+            "<div class='info-strip'>Pasale tus capturas de resumen a Claude (chat normal) y pedile que te devuelva "
+            "el CSV con columnas <code>Fecha,Concepto,Monto,Cuotas</code>. Pegalo acá. "
+            "Si el CSV no trae columna Tarjeta, elegí una abajo — se aplica a todas las filas.</div>",
+            unsafe_allow_html=True
+        )
+        csv_text = st.text_area("", placeholder="Fecha,Concepto,Monto,Cuotas\n2026-05-24,MERPAGO*SOFIACARLINI,16476.46,1\n...", height=140, label_visibility="collapsed", key="csv_import_text")
+        tarjeta_import = st.selectbox("Tarjeta para estos movimientos (si el CSV no la trae)", TARJETAS, key="tarjeta_import_sel")
+
+        if st.button("🔍 Previsualizar", key="preview_csv"):
             if csv_text.strip():
                 try:
                     nuevos = pd.read_csv(io.StringIO(csv_text.strip()), dtype=str).fillna("")
+                    nuevos.columns = [c.strip() for c in nuevos.columns]
+                    if "Tarjeta" not in nuevos.columns or (nuevos["Tarjeta"].astype(str).str.strip() == "").all():
+                        nuevos["Tarjeta"] = tarjeta_import
                     for col in FILES["gastos"][1]:
                         if col not in nuevos.columns:
                             nuevos[col] = "0" if col in ["Monto","Cuanto recupero"] else ("No" if col=="Compartido" else "")
                     nuevos = nuevos[FILES["gastos"][1]]
-                    # Normalizar fechas del CSV importado
-                    nuevos["Fecha"] = nuevos["Fecha"].apply(fmt_fecha)
-                    gastos_df = pd.concat([gastos_df, nuevos], ignore_index=True)
-                    gastos_df = sort_by_fecha(gastos_df)
-                    save("gastos", gastos_df)
-                    st.success(f"{len(nuevos)} movimientos importados.")
-                    st.rerun()
+                    nuevos["Fecha"] = nuevos["Fecha"].apply(normalizar_fecha_existente)
+                    nuevos["Monto"] = to_num(nuevos["Monto"])
+
+                    # Filtrar duplicados contra lo que ya está guardado
+                    gastos_actuales = load("gastos")
+                    gastos_actuales["Monto"] = to_num(gastos_actuales["Monto"])
+
+                    es_dup_mask = nuevos.apply(
+                        lambda r: es_duplicado(r["Fecha"], r["Concepto"], r["Monto"], r["Tarjeta"], gastos_actuales),
+                        axis=1
+                    )
+                    nuevos_filtrados = nuevos[~es_dup_mask].copy()
+                    duplicados_count = int(es_dup_mask.sum())
+
+                    st.session_state["_csv_preview"] = nuevos_filtrados
+                    st.session_state["_csv_dup_count"] = duplicados_count
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    st.error(f"No pude leer el CSV: {e}")
+                    st.session_state.pop("_csv_preview", None)
             else:
                 st.warning("Pegá el CSV primero.")
+
+        if "_csv_preview" in st.session_state:
+            preview = st.session_state["_csv_preview"]
+            dup_count = st.session_state.get("_csv_dup_count", 0)
+
+            if dup_count > 0:
+                st.markdown(f"<div class='info-strip'>⏭️ {dup_count} movimiento(s) ya existían y se omiten automáticamente.</div>", unsafe_allow_html=True)
+
+            if preview.empty:
+                st.markdown("<div class='empty'><big>✅</big>Nada nuevo para importar — todo ya estaba cargado.</div>", unsafe_allow_html=True)
+            else:
+                st.caption(f"{len(preview)} movimiento(s) nuevo(s) para importar:")
+                for _, r in preview.iterrows():
+                    st.markdown(
+                        "<div class='tx'>"
+                        f"<div class='tx-ico'>{emoji_cat(str(r.get('Categoria','💳')))}</div>"
+                        "<div class='tx-main'>"
+                        f"<div class='tx-name'>{r.get('Concepto','—')}</div>"
+                        f"<div class='tx-info'>{str(r.get('Fecha',''))[:10] or 'sin fecha'} · {r.get('Tarjeta','')}</div>"
+                        "</div>"
+                        f"<div class='tx-amt c-neg'>−{fmt_ars(r.get('Monto',0))}</div>"
+                        "</div>", unsafe_allow_html=True)
+
+                if st.button(f"✅ Confirmar e importar {len(preview)} movimiento(s)", key="confirm_import"):
+                    base = load("gastos")
+                    base["Monto"] = to_num(base["Monto"])
+                    final = pd.concat([base, preview], ignore_index=True)
+                    final = sort_by_fecha(final)
+                    save("gastos", final)
+                    st.session_state.pop("_csv_preview", None)
+                    st.session_state.pop("_csv_dup_count", None)
+                    st.success(f"✅ {len(preview)} movimientos importados.")
+                    st.rerun()
 
     with st.expander("✏️ Carga manual"):
         with st.form("f_gasto_full", clear_on_submit=True):
