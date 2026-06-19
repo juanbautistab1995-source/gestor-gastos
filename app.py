@@ -20,6 +20,7 @@ CAT_GASTOS = ["🍔 Comida","🚗 Transporte","🎉 Salidas","✈️ Viaje","�
 CAT_ING    = ["💼 Sueldo","💻 Freelance","📈 Inversión","🎁 Regalo","💰 Otro"]
 MONEDAS    = ["ARS","USD","EUR"]
 COLORES_TARJETA = ["#7c6af7","#4ade80","#f87171","#fbbf24","#60a5fa","#f472b6","#34d399","#fb923c"]
+# BUG 3 FIX: tarjetas por defecto siempre presentes
 TARJETAS_DEFAULT = ["Visa ICBC","Visa Hipotecario","Master ICBC","Efectivo","Débito","Otro"]
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -36,6 +37,7 @@ def _parsear_fecha_es(s):
         return None
 
     s_lower = s.lower()
+    # DD-MMM-YYYY con mes en español (05-jun-2026, 13-abr-2026)
     for mes_es, mes_num in _MESES_ES.items():
         if f"-{mes_es}-" in s_lower:
             try:
@@ -60,7 +62,8 @@ def _parsear_fecha_es(s):
         return None
 
 def fmt_fecha(d):
-    """Para INPUTS NUEVOS (date_input del formulario)."""
+    """Para INPUTS NUEVOS (date_input del formulario): siempre devuelve una fecha,
+    usa hoy como fallback porque el usuario está creando un gasto AHORA."""
     try:
         if pd.isnull(d):
             return str(date.today())
@@ -74,7 +77,9 @@ def fmt_fecha(d):
     return parsed if parsed else str(date.today())
 
 def normalizar_fecha_existente(s):
-    """Para DATOS YA GUARDADOS en el CSV: normaliza el formato si se puede."""
+    """Para DATOS YA GUARDADOS en el CSV: normaliza el formato si se puede,
+    pero si no hay fecha reconocible, devuelve "" (vacío) para que quede
+    correctamente al fondo en el ordenamiento, en vez de inventar la fecha de hoy."""
     parsed = _parsear_fecha_es(s)
     return parsed if parsed else ""
 
@@ -128,13 +133,15 @@ def safe_int(val, default=1):
         return default
 
 def get_tarjetas_nombres():
-    nombres = list(TARJETAS_DEFAULT)
+    """BUG 3 FIX: siempre incluye defaults + las configuradas + las que aparecen en gastos"""
+    nombres = list(TARJETAS_DEFAULT)  # empieza con defaults
     t_df = load("tarjetas")
     if not t_df.empty:
         for n in t_df["Nombre"].dropna().tolist():
             n = str(n).strip()
             if n and n not in nombres:
                 nombres.append(n)
+    # también agregar las que están en gastos importados
     g_df = load("gastos")
     if not g_df.empty and "Tarjeta" in g_df.columns:
         for t in g_df["Tarjeta"].dropna().unique():
@@ -193,53 +200,49 @@ def get_color_tarjeta(tname, tarjetas_df):
     return COLORES_TARJETA[idx % len(COLORES_TARJETA)]
 
 # ── Importación de movimientos desde texto/CSV pegado ──────────────────────────
+def _normalizar_texto(s):
+    """Normaliza un string para comparación: minúsculas, sin espacios extra,
+    sin espacios dobles internos."""
+    s = str(s).strip().lower()
+    s = " ".join(s.split())  # colapsa espacios múltiples
+    return s
+
 def es_duplicado(fecha_str, concepto, monto, tarjeta, gastos_existentes):
-    """Chequea si un movimiento ya existe en la base de forma robusta."""
+    """Chequea si un movimiento ya existe en la base.
+    Match ESTRICTO de las 4 columnas: Tarjeta + Fecha + Concepto + Monto (tolerancia $1).
+    Las 4 tienen que coincidir para considerarlo duplicado."""
     if gastos_existentes.empty:
         return False
-    
-    concepto_norm = str(concepto).strip().lower()
-    tarjeta_norm  = str(tarjeta).strip().lower()
-    fecha_norm    = str(fecha_str).strip()
-    
+
+    concepto_norm = _normalizar_texto(concepto)
+    tarjeta_norm  = _normalizar_texto(tarjeta)
+    fecha_norm    = _normalizar_texto(fecha_str)
+
     try:
-        # Usamos valor absoluto porque los resúmenes bancarios suelen traer montos negativos
-        monto_f = abs(float(monto))
+        monto_f = float(monto)
     except (ValueError, TypeError):
         return False
 
-    # Filtrar solo por coincidencia en Concepto
-    candidatos = gastos_existentes[
-        gastos_existentes["Concepto"].astype(str).str.strip().str.lower() == concepto_norm
+    existentes = gastos_existentes.copy()
+    existentes["_concepto_norm"] = existentes["Concepto"].apply(_normalizar_texto)
+    existentes["_tarjeta_norm"]  = existentes["Tarjeta"].apply(_normalizar_texto)
+    existentes["_fecha_norm"]    = existentes["Fecha"].apply(_normalizar_texto)
+
+    candidatos = existentes[
+        (existentes["_concepto_norm"] == concepto_norm) &
+        (existentes["_tarjeta_norm"]  == tarjeta_norm) &
+        (existentes["_fecha_norm"]    == fecha_norm)
     ]
     if candidatos.empty:
         return False
 
     for _, r in candidatos.iterrows():
         try:
-            monto_existente = abs(float(r.get("Monto", 0)))
+            monto_existente = float(r.get("Monto", 0))
         except (ValueError, TypeError):
             continue
-            
-        # Tolerancia de $1 por si hay centavos de diferencia o redondeos en el CSV
         if abs(monto_existente - monto_f) < 1.0:
-            fecha_existente = str(r.get("Fecha","")).strip()
-            tarj_existente = str(r.get("Tarjeta","")).strip().lower()
-            
-            # Cortar a 10 chars (YYYY-MM-DD) para asegurar una comparación limpia
-            f_exist_10 = fecha_existente[:10] if fecha_existente else ""
-            f_norm_10 = fecha_norm[:10] if fecha_norm else ""
-            
-            # 1. Si tienen la misma fecha y monto, asumimos duplicado
-            # (Incluso si la tarjeta difiere, previene error humano de elegir mala tarjeta en importación)
-            if f_exist_10 and f_exist_10 == f_norm_10:
-                return True
-                
-            # 2. Si alguna no tiene fecha, entonces verificamos validación de tarjeta
-            if not f_exist_10 or not f_norm_10:
-                if tarjeta_norm == tarj_existente or not tarjeta_norm or not tarj_existente:
-                    return True
-                    
+            return True
     return False
 
 # ── CSS ────────────────────────────────────────────────────────────────────────
@@ -319,7 +322,7 @@ label[data-testid="stWidgetLabel"] p{font-size:0.68rem!important;font-weight:600
 if "gasto_limit" not in st.session_state: st.session_state.gasto_limit = 30
 if "menu_accion" not in st.session_state: st.session_state.menu_accion = False
 
-# ── Cargar datos ───────────────────────────────────────────────────────────────
+# ── Cargar datos (dtype=str para no perder nada, numéricos explícitos después) ─
 gastos_df   = load("gastos")
 ingresos_df = load("ingresos")
 comp_df     = load("compartidos")
@@ -327,21 +330,28 @@ inv_df      = load("inversiones")
 pres_df     = load("presupuesto")
 tarjetas_df = load("tarjetas")
 
+# Numéricos explícitos — nunca tocar strings raros
 gastos_df["Monto"]          = to_num(gastos_df["Monto"])
 gastos_df["Cuanto recupero"]= to_num(gastos_df["Cuanto recupero"])
 ingresos_df["Monto"]        = to_num(ingresos_df["Monto"])
 comp_df["Monto"]            = to_num(comp_df["Monto"])
 
+# Normalizar TODAS las fechas de gastos a YYYY-MM-DD en cada carga.
+# Usa normalizar_fecha_existente (NO fmt_fecha) para no inventar "hoy"
+# en filas que genuinamente no tienen fecha — esas deben ir al fondo del orden.
 if not gastos_df.empty:
     gastos_df["Fecha"] = gastos_df["Fecha"].apply(normalizar_fecha_existente)
 
 y, m = mes_actual()
 nombre_mes = calendar.month_name[m].capitalize()
 
+# BUG 5 FIX: ordenar por fecha correctamente desde el inicio
 def sort_by_fecha(df):
+    """Ordena por fecha desc. Los None/NaT (sin fecha) van siempre al fondo."""
     if df.empty: return df
     df = df.copy()
     df["_sort"] = pd.to_datetime(df["Fecha"], errors="coerce")
+    # na_position="last": filas sin fecha van al fondo, no al tope
     df = df.sort_values("_sort", ascending=False, na_position="last").drop(columns=["_sort"])
     return df
 
@@ -386,11 +396,13 @@ if st.session_state.menu_accion:
             q_t = c3.selectbox("Tarjeta", TARJETAS)
             q_k = c4.selectbox("Categoría", CAT_GASTOS)
             c5,c6 = st.columns(2)
+            # BUG 1 FIX: date_input nativo de Python, sin conversión manual
             q_f = c5.date_input("Fecha", value=date.today())
             q_cu = c6.number_input("Cuotas", min_value=1, max_value=48, value=1)
             ca,cb = st.columns([3,1])
             if ca.form_submit_button("Guardar gasto"):
                 if q_c.strip() and q_m > 0:
+                    # BUG 6 FIX: usar fmt_fecha que convierte date→YYYY-MM-DD sin distorsión
                     fecha_str = fmt_fecha(q_f)
                     nv = pd.DataFrame([[fecha_str, q_c.strip(), q_m, q_t, q_cu, q_k, "No", "", 0, ""]],
                                       columns=FILES["gastos"][1])
@@ -482,10 +494,12 @@ with tabs[0]:
         f"{recup_cell}"
         "</div>", unsafe_allow_html=True)
 
+    # Recargar del disco una sola vez para toda la sección home
     gastos_fresh = load("gastos")
     gastos_fresh["Monto"] = to_num(gastos_fresh["Monto"])
     gastos_fresh = sort_by_fecha(gastos_fresh)
 
+    # Resumen tarjetas — mes calendario, datos frescos del disco
     st.markdown("<div class='sec'>Esta quincena / período</div>", unsafe_allow_html=True)
     gastos_mes_fresh = filtrar_mes(gastos_fresh, y, m)
     tarjetas_con_gasto = {}
@@ -516,6 +530,7 @@ with tabs[0]:
     else:
         st.markdown("<div class='empty'><big>💸</big>Sin gastos este mes.</div>", unsafe_allow_html=True)
 
+    # Últimos movimientos — priorizar los que TIENEN fecha real
     st.markdown("<div class='sec'>Últimos movimientos</div>", unsafe_allow_html=True)
     _tiene_fecha = pd.to_datetime(gastos_fresh["Fecha"], errors="coerce").notna()
     _con_fecha   = gastos_fresh[_tiene_fecha].head(8)
@@ -530,6 +545,7 @@ with tabs[0]:
             tname_r = str(r.get("Tarjeta",""))
             cuotas_v = safe_int(r.get("Cuotas",1), 1)
             cuotas_t = f" · {cuotas_v}c" if cuotas_v > 1 else ""
+            # chip de período solo si la tarjeta tiene cierre configurado
             chip = ""
             if not tarjetas_df.empty and tname_r in tarjetas_df["Nombre"].values:
                 ay, am = periodo_actual_de_gasto(r.get("Fecha",""), tname_r)
@@ -545,6 +561,7 @@ with tabs[0]:
                 f"<div class='tx-amt c-neg'>−{fmt_ars(r.get('Monto',0))}</div>"
                 "</div>", unsafe_allow_html=True)
 
+    # Pendientes
     pend = comp_df[comp_df["Estado"] == "Pendiente"] if not comp_df.empty else pd.DataFrame()
     if not pend.empty:
         st.markdown("<div class='sec'>Te deben</div>", unsafe_allow_html=True)
@@ -593,12 +610,9 @@ with tabs[1]:
                     nuevos["Fecha"] = nuevos["Fecha"].apply(normalizar_fecha_existente)
                     nuevos["Monto"] = to_num(nuevos["Monto"])
 
+                    # Filtrar duplicados contra lo que ya está guardado
                     gastos_actuales = load("gastos")
                     gastos_actuales["Monto"] = to_num(gastos_actuales["Monto"])
-                    
-                    # FIX: Normalizar las fechas de los datos actuales antes de hacer la validación cruzada
-                    if not gastos_actuales.empty:
-                        gastos_actuales["Fecha"] = gastos_actuales["Fecha"].apply(normalizar_fecha_existente)
 
                     es_dup_mask = nuevos.apply(
                         lambda r: es_duplicado(r["Fecha"], r["Concepto"], r["Monto"], r["Tarjeta"], gastos_actuales),
@@ -661,6 +675,7 @@ with tabs[1]:
             g_f    = c5.date_input("Fecha", value=date.today())
             g_comp = c6.selectbox("Compartido", ["No","Sí"])
             c7,c8 = st.columns(2)
+            # BUG 7 FIX: text_input para "Con quién" — nunca number_input
             g_quien = c7.text_input("Con quién", placeholder="Nombre")
             g_rec   = c8.number_input("Recuperás $", min_value=0.0, step=100.0) if g_comp == "Sí" else 0.0
             g_nota  = st.text_input("Nota", placeholder="Opcional")
@@ -737,6 +752,7 @@ with tabs[2]:
 
     st.markdown("<div class='sec'>Configuración de tarjetas</div>", unsafe_allow_html=True)
 
+    # ABM siempre visible, incluso si está vacío (se puede agregar con num_rows="dynamic")
     if tarjetas_df.empty:
         tarjetas_edit = pd.DataFrame(columns=["Nombre","Dia cierre","Dia vencimiento","Color"])
     else:
@@ -778,11 +794,14 @@ with tabs[2]:
     sel_py, sel_pm = periodos[opciones_per.index(per_sel)]
 
     inicio_p, fin_p = get_periodo_tarjeta(t_sel, sel_py, sel_pm)
+    # Leer siempre del disco — fuente de verdad
     gastos_base = load("gastos")
     gastos_base["Monto"] = to_num(gastos_base["Monto"])
     gastos_base["Cuanto recupero"] = to_num(gastos_base["Cuanto recupero"])
+    # _row_id = posición exacta en el CSV (0-indexed), ESTABLE para esta lectura
     gastos_base["_row_id"] = range(len(gastos_base))
     df_per = filtrar_gastos_tarjeta_periodo(gastos_base, t_sel, sel_py, sel_pm)
+    # Guardar los row_ids en session_state para que el botón los use aunque Streamlit re-ejecute
     _key_ids = f"row_ids_{t_sel}_{sel_py}_{sel_pm}"
     if not df_per.empty:
         st.session_state[_key_ids] = list(df_per["_row_id"].astype(int))
@@ -811,6 +830,7 @@ with tabs[2]:
         "</div>", unsafe_allow_html=True)
 
     if not df_per.empty:
+        # Preparar df para el editor — quitar _row_id antes de mostrar
         df_ed = df_per.drop(columns=["_row_id"], errors="ignore").copy().reset_index(drop=True)
 
         df_ed["Fecha"]           = df_ed["Fecha"].apply(lambda x: pd.to_datetime(x, errors="coerce").date() if str(x) not in ("S/F","","nan") else None)
@@ -847,11 +867,13 @@ with tabs[2]:
             _key_ids = f"row_ids_{t_sel}_{sel_py}_{sel_pm}"
             ids_a_eliminar = set(st.session_state.get(_key_ids, []))
 
+            # Leer CSV del disco en este momento exacto
             base = load("gastos")
             base["Monto"]           = to_num(base["Monto"])
             base["Cuanto recupero"] = to_num(base["Cuanto recupero"])
             base["_row_id"]         = range(len(base))
 
+            # Validar que los IDs a eliminar están dentro del rango actual del CSV
             max_id = len(base) - 1
             ids_validos = {i for i in ids_a_eliminar if 0 <= i <= max_id}
 
@@ -859,8 +881,10 @@ with tabs[2]:
                 st.error("Error de sincronización. Recargá la página y volvé a intentar.")
                 st.stop()
 
+            # Quitar solo esas filas exactas
             base_limpia = base[~base["_row_id"].isin(ids_validos)].drop(columns=["_row_id"]).reset_index(drop=True)
 
+            # Preparar filas editadas
             nuevas = edited_per.copy()
             nuevas["Fecha"]           = nuevas["Fecha"].apply(fmt_fecha)
             nuevas["Monto"]           = to_num(nuevas["Monto"])
@@ -873,6 +897,7 @@ with tabs[2]:
             final = pd.concat([base_limpia, nuevas], ignore_index=True)
             final = sort_by_fecha(final)
             save("gastos", final)
+            # Limpiar session_state para este período
             if _key_ids in st.session_state:
                 del st.session_state[_key_ids]
             st.success(f"✅ Guardado. {len(nuevas)} filas actualizadas.")
@@ -1108,5 +1133,3 @@ with tabs[6]:
             "<span class='total-strip-label'>Presupuestado total</span>"
             f"<span class='total-strip-val'>{fmt_ars(t_gast)} / {fmt_ars(t_lim)}</span>"
             "</div>", unsafe_allow_html=True)
-
-```
