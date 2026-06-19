@@ -207,6 +207,34 @@ def _normalizar_texto(s):
     s = " ".join(s.split())  # colapsa espacios múltiples
     return s
 
+def limpiar_csv_montos(texto_csv):
+    """Pre-procesa un CSV crudo donde los montos pueden venir con coma de miles
+    SIN comillas (ej: 5,000.00) o CON comillas (ej: "224,679.00").
+    Ambos casos rompen el parseo estándar de CSV porque la coma se confunde
+    con el separador de columnas. Esta función junta esos fragmentos en un solo
+    campo antes de que pandas lea el archivo.
+    Detecta patrones tipo: ,NUMERO,NUMERO.NUMERO  o  ,"NUMERO,NUMERO.NUMERO",
+    y los convierte a: ,NUMERO.NUMERO (sin coma de miles)."""
+    import re
+    lineas = texto_csv.strip().split("\n")
+    if not lineas:
+        return texto_csv
+
+    resultado = [lineas[0]]  # header tal cual
+    n_cols_esperadas = len(lineas[0].split(","))
+
+    for linea in lineas[1:]:
+        if not linea.strip():
+            continue
+        # Caso 1: monto entre comillas con coma de miles -> "224,679.00" => 224679.00
+        linea_fix = re.sub(r'"(\d{1,3}(?:,\d{3})+\.\d+)"', lambda m: m.group(1).replace(",", ""), linea)
+        # Caso 2: monto SIN comillas con coma de miles suelta en medio de la línea
+        # Patrón: ,NUMERO,NUMERO.NUMERO  (ej: ,5,000.00) -> ,5000.00
+        linea_fix = re.sub(r',(\d{1,3}),(\d{3}\.\d+)', r',\1\2', linea_fix)
+        resultado.append(linea_fix)
+
+    return "\n".join(resultado)
+
 def es_duplicado(fecha_str, concepto, monto, tarjeta, gastos_existentes):
     """Chequea si un movimiento ya existe en la base.
     Match ESTRICTO de las 4 columnas: Tarjeta + Fecha + Concepto + Monto (tolerancia $1).
@@ -586,6 +614,31 @@ with tabs[0]:
 # TAB 1 — GASTOS
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[1]:
+    with st.expander("📤 Exportar todos los gastos (backup)"):
+        st.markdown(
+            "<div class='info-strip'>Copiá este texto y guardalo aparte. Si en algún momento se pierden gastos "
+            "por una actualización del código, lo pegás en el importador de arriba y los recuperás.</div>",
+            unsafe_allow_html=True
+        )
+        gastos_export = load("gastos")
+        if gastos_export.empty:
+            st.caption("No hay gastos cargados todavía.")
+        else:
+            csv_export = gastos_export.to_csv(index=False)
+            st.text_area(
+                f"{len(gastos_export)} movimientos en total",
+                value=csv_export,
+                height=160,
+                key="export_csv_area"
+            )
+            st.download_button(
+                "⬇️ Descargar como archivo .csv",
+                data=csv_export,
+                file_name=f"backup_gastos_{date.today().isoformat()}.csv",
+                mime="text/csv",
+                key="download_csv_btn"
+            )
+
     with st.expander("📥 Importar desde CSV / foto de resumen"):
         st.markdown(
             "<div class='info-strip'>Pasale tus capturas de resumen a Claude (chat normal) y pedile que te devuelva "
@@ -599,7 +652,8 @@ with tabs[1]:
         if st.button("🔍 Previsualizar", key="preview_csv"):
             if csv_text.strip():
                 try:
-                    nuevos = pd.read_csv(io.StringIO(csv_text.strip()), dtype=str).fillna("")
+                    csv_limpio = limpiar_csv_montos(csv_text)
+                    nuevos = pd.read_csv(io.StringIO(csv_limpio), dtype=str).fillna("")
                     nuevos.columns = [c.strip() for c in nuevos.columns]
                     if "Tarjeta" not in nuevos.columns or (nuevos["Tarjeta"].astype(str).str.strip() == "").all():
                         nuevos["Tarjeta"] = tarjeta_import
@@ -613,6 +667,10 @@ with tabs[1]:
                     # Filtrar duplicados contra lo que ya está guardado
                     gastos_actuales = load("gastos")
                     gastos_actuales["Monto"] = to_num(gastos_actuales["Monto"])
+                    # CRÍTICO: normalizar también la fecha de los datos ya guardados.
+                    # Si no se hace, una fecha guardada en formato distinto al normalizado
+                    # nunca matchea contra el CSV nuevo y el duplicado se cuela.
+                    gastos_actuales["Fecha"] = gastos_actuales["Fecha"].apply(normalizar_fecha_existente)
 
                     es_dup_mask = nuevos.apply(
                         lambda r: es_duplicado(r["Fecha"], r["Concepto"], r["Monto"], r["Tarjeta"], gastos_actuales),
@@ -661,6 +719,33 @@ with tabs[1]:
                     st.session_state.pop("_csv_dup_count", None)
                     st.success(f"✅ {len(preview)} movimientos importados.")
                     st.rerun()
+
+    with st.expander("📤 Exportar / Backup de todos los gastos"):
+        st.markdown(
+            "<div class='info-strip'>Descargá un backup completo antes de modificar el código. "
+            "El CSV generado se puede pegar tal cual en el importador de arriba para restaurar todo.</div>",
+            unsafe_allow_html=True
+        )
+        gastos_export = load("gastos")
+        if gastos_export.empty:
+            st.markdown("<div class='empty'><big>📋</big>No hay gastos cargados todavía.</div>", unsafe_allow_html=True)
+        else:
+            gastos_export = sort_by_fecha(gastos_export)
+            csv_bytes = gastos_export.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label=f"⬇️ Descargar backup ({len(gastos_export)} movimientos)",
+                data=csv_bytes,
+                file_name=f"backup_gastos_{date.today().isoformat()}.csv",
+                mime="text/csv",
+                key="download_backup"
+            )
+            st.caption("También podés copiar el texto de abajo y guardarlo donde quieras:")
+            st.text_area(
+                "CSV completo (para copiar)",
+                value=gastos_export.to_csv(index=False),
+                height=160,
+                key="export_csv_text"
+            )
 
     with st.expander("✏️ Carga manual"):
         with st.form("f_gasto_full", clear_on_submit=True):
