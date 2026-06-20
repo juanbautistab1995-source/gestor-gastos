@@ -89,10 +89,15 @@ def _limpiar_nulos_literales(df):
     """Convierte strings literales como 'None', 'nan', 'NaT' (que Streamlit
     puede llegar a persistir en el CSV al guardar filas vacías del data_editor)
     en strings vacíos reales. Sin esto, fillna('') no los detecta porque
-    técnicamente no son NaN, son texto."""
+    técnicamente no son NaN, son texto.
+    Solo toca columnas de tipo texto (object) — las numéricas no aceptan
+    asignación de string vacío y rompen con TypeError."""
     for col in df.columns:
+        if df[col].dtype != object:
+            continue  # columnas numéricas (float/int) no pueden recibir "" — se omiten
         mask = df[col].astype(str).str.strip().str.lower().isin(_VALORES_NULOS_LITERALES)
-        df.loc[mask, col] = ""
+        if mask.any():
+            df.loc[mask, col] = ""
     return df
 
 def load(key):
@@ -669,8 +674,20 @@ with tabs[1]:
                     csv_limpio = limpiar_csv_montos(csv_text)
                     nuevos = pd.read_csv(io.StringIO(csv_limpio), dtype=str).fillna("")
                     nuevos.columns = [c.strip() for c in nuevos.columns]
-                    if "Tarjeta" not in nuevos.columns or (nuevos["Tarjeta"].astype(str).str.strip() == "").all():
+
+                    # La tarjeta seleccionada en el selectbox es el FALLBACK:
+                    # se usa siempre que el CSV no traiga Tarjeta, o la traiga
+                    # vacía / "None" / "nan" en esa fila puntual (no solo si TODAS
+                    # las filas están vacías — antes una fila con dato y otra sin
+                    # dato dejaba esta última sin tarjeta asignada).
+                    if "Tarjeta" not in nuevos.columns:
                         nuevos["Tarjeta"] = tarjeta_import
+                    else:
+                        tarjeta_vacia_mask = nuevos["Tarjeta"].astype(str).str.strip().str.lower().isin(
+                            {"", "none", "nan", "nat", "null", "<na>"}
+                        )
+                        nuevos.loc[tarjeta_vacia_mask, "Tarjeta"] = tarjeta_import
+
                     for col in FILES["gastos"][1]:
                         if col not in nuevos.columns:
                             nuevos[col] = "0" if col in ["Monto","Cuanto recupero"] else ("No" if col=="Compartido" else "")
