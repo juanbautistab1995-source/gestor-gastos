@@ -177,7 +177,8 @@ def get_periodo_tarjeta(tarjeta_nombre, año=None, mes=None):
     if t_df.empty or tarjeta_nombre not in t_df["Nombre"].values:
         return date(año, mes, 1), date(año, mes, calendar.monthrange(año, mes)[1])
     row = t_df[t_df["Nombre"] == tarjeta_nombre].iloc[0]
-    dia_cierre = min(safe_int(row.get("Dia cierre", 1), 1), 28)
+    # Sin techo fijo en 28: se ajusta al último día real de cada mes más abajo
+    dia_cierre = safe_int(row.get("Dia cierre", 1), 1)
     mes_ant, año_ant = (12, año-1) if mes == 1 else (mes-1, año)
     ultimo_mes_ant = calendar.monthrange(año_ant, mes_ant)[1]
     inicio = date(año_ant, mes_ant, min(dia_cierre+1, ultimo_mes_ant))
@@ -188,15 +189,30 @@ def periodo_actual_de_gasto(fecha_str, tarjeta_nombre):
     s = str(fecha_str).strip()
     if not s or s.lower() in ("s/f", "nan", "nat", "none", ""):
         hoy = date.today(); return hoy.year, hoy.month
+    # CRÍTICO: las fechas ya guardadas en la base están normalizadas a YYYY-MM-DD
+    # (sin ambigüedad). Usar dayfirst=True sobre un string YYYY-MM-DD lo reinterpreta
+    # mal (ej: "2026-06-11" con dayfirst=True devuelve 2026-11-06 -> ¡noviembre!).
+    # Por eso primero se intenta el formato ISO exacto, y solo si falla
+    # se cae a un parseo más flexible con dayfirst para fechas crudas tipo DD/MM/YYYY.
+    fg = None
     try:
-        fg = pd.to_datetime(s, dayfirst=True).date()
-    except:
-        hoy = date.today(); return hoy.year, hoy.month
+        fg = datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        pass
+    if fg is None:
+        try:
+            fg = pd.to_datetime(s, dayfirst=True).date()
+        except Exception:
+            hoy = date.today(); return hoy.year, hoy.month
     t_df = load("tarjetas")
     if t_df.empty or tarjeta_nombre not in t_df["Nombre"].values:
         return fg.year, fg.month
     row = t_df[t_df["Nombre"] == tarjeta_nombre].iloc[0]
-    dia_cierre = min(safe_int(row.get("Dia cierre", 1), 1), 28)
+    # Sin techo fijo en 28: si el mes del gasto tiene menos días que el cierre
+    # configurado (ej. cierre=31 en febrero), se ajusta al último día real de ESE mes
+    dia_cierre_raw = safe_int(row.get("Dia cierre", 1), 1)
+    ultimo_dia_mes_gasto = calendar.monthrange(fg.year, fg.month)[1]
+    dia_cierre = min(dia_cierre_raw, ultimo_dia_mes_gasto)
     if fg.day <= dia_cierre:
         return fg.year, fg.month
     return (fg.year+1, 1) if fg.month == 12 else (fg.year, fg.month+1)
@@ -902,6 +918,32 @@ with tabs[2]:
 
     st.markdown("<div class='sec'>Configuración de tarjetas</div>", unsafe_allow_html=True)
 
+    # Botón de configuración rápida: crea/reemplaza las 3 tarjetas conocidas
+    # con los datos reales de tus resúmenes (Banco Nación / Banco Hipotecario).
+    # Soluciona de raíz el problema de tarjetas sin configurar que hacían
+    # caer todo al fallback de "mes calendario completo" en vez del ciclo real.
+    if tarjetas_df.empty or len(tarjetas_df) < 3:
+        st.markdown(
+            "<div class='info-strip'>⚠️ Tenés menos de 3 tarjetas configuradas. "
+            "Sin la configuración correcta, los períodos caen al mes calendario completo "
+            "en vez de tu ciclo real de cierre/vencimiento.</div>",
+            unsafe_allow_html=True
+        )
+        if st.button("⚡ Configurar mis 3 tarjetas con un click", key="setup_rapido"):
+            config_rapida = pd.DataFrame([
+                ["Visa ICBC",        28, 10, "#7c6af7"],
+                ["Visa Hipotecario", 28,  5, "#4ade80"],
+                ["Master ICBC",      28, 10, "#f87171"],
+            ], columns=["Nombre","Dia cierre","Dia vencimiento","Color"])
+            # Conservar tarjetas existentes que no estén en esta lista
+            nombres_config = config_rapida["Nombre"].tolist()
+            resto = tarjetas_df[~tarjetas_df["Nombre"].isin(nombres_config)] if not tarjetas_df.empty else pd.DataFrame(columns=config_rapida.columns)
+            final_tarjetas = pd.concat([config_rapida, resto], ignore_index=True)
+            save("tarjetas", final_tarjetas)
+            st.success("✅ Tarjetas configuradas: Visa ICBC, Visa Hipotecario, Master ICBC.")
+            st.rerun()
+        st.divider()
+
     # ABM siempre visible, incluso si está vacío (se puede agregar con num_rows="dynamic")
     if tarjetas_df.empty:
         tarjetas_edit = pd.DataFrame(columns=["Nombre","Dia cierre","Dia vencimiento","Color"])
@@ -919,7 +961,7 @@ with tabs[2]:
         use_container_width=True,
         column_config={
             "Nombre":          st.column_config.TextColumn("Nombre"),
-            "Dia cierre":      st.column_config.NumberColumn("Día cierre", min_value=1, max_value=28, step=1),
+            "Dia cierre":      st.column_config.NumberColumn("Día cierre", min_value=1, max_value=31, step=1),
             "Dia vencimiento": st.column_config.NumberColumn("Día vence", min_value=1, max_value=31, step=1),
             "Color":           st.column_config.SelectboxColumn("Color", options=["#7c6af7","#4ade80","#f87171","#fbbf24","#60a5fa","#f472b6","#34d399","#fb923c"]),
         },
