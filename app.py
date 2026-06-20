@@ -83,10 +83,23 @@ def normalizar_fecha_existente(s):
     parsed = _parsear_fecha_es(s)
     return parsed if parsed else ""
 
+_VALORES_NULOS_LITERALES = {"none", "nan", "nat", "<na>", "null"}
+
+def _limpiar_nulos_literales(df):
+    """Convierte strings literales como 'None', 'nan', 'NaT' (que Streamlit
+    puede llegar a persistir en el CSV al guardar filas vacías del data_editor)
+    en strings vacíos reales. Sin esto, fillna('') no los detecta porque
+    técnicamente no son NaN, son texto."""
+    for col in df.columns:
+        mask = df[col].astype(str).str.strip().str.lower().isin(_VALORES_NULOS_LITERALES)
+        df.loc[mask, col] = ""
+    return df
+
 def load(key):
     f, cols = FILES[key]
     if os.path.exists(f):
         df = pd.read_csv(f, dtype=str).fillna("")
+        df = _limpiar_nulos_literales(df)
         for c in cols:
             if c not in df.columns:
                 df[c] = ""
@@ -95,6 +108,7 @@ def load(key):
 
 def save(key, df):
     f, _ = FILES[key]
+    df = _limpiar_nulos_literales(df.copy())
     df.to_csv(f, index=False)
 
 def to_num(series):
@@ -664,6 +678,16 @@ with tabs[1]:
                     nuevos["Fecha"] = nuevos["Fecha"].apply(normalizar_fecha_existente)
                     nuevos["Monto"] = to_num(nuevos["Monto"])
 
+                    # Excluir pagos de tarjeta y ajustes — NO son gastos de consumo.
+                    # "SU PAGO EN PESOS", montos negativos o $0 son pagos/ajustes del resumen,
+                    # no compras. Si se importan como gasto, rompen el remanente porque
+                    # un monto negativo resta en vez de sumar al total de gastos.
+                    PALABRAS_EXCLUIR = ["su pago en pesos", "pago en pesos", "saldo anterior", "pago tarjeta"]
+                    concepto_lower = nuevos["Concepto"].astype(str).str.strip().str.lower()
+                    es_pago_mask = concepto_lower.isin(PALABRAS_EXCLUIR) | nuevos["Monto"].astype(float).le(0)
+                    excluidos_count = int(es_pago_mask.sum())
+                    nuevos = nuevos[~es_pago_mask].copy()
+
                     # Filtrar duplicados contra lo que ya está guardado
                     gastos_actuales = load("gastos")
                     gastos_actuales["Monto"] = to_num(gastos_actuales["Monto"])
@@ -681,6 +705,7 @@ with tabs[1]:
 
                     st.session_state["_csv_preview"] = nuevos_filtrados
                     st.session_state["_csv_dup_count"] = duplicados_count
+                    st.session_state["_csv_excl_count"] = excluidos_count
                 except Exception as e:
                     st.error(f"No pude leer el CSV: {e}")
                     st.session_state.pop("_csv_preview", None)
@@ -690,6 +715,10 @@ with tabs[1]:
         if "_csv_preview" in st.session_state:
             preview = st.session_state["_csv_preview"]
             dup_count = st.session_state.get("_csv_dup_count", 0)
+            excl_count = st.session_state.get("_csv_excl_count", 0)
+
+            if excl_count > 0:
+                st.markdown(f"<div class='info-strip'>🚫 {excl_count} fila(s) excluida(s) — eran pagos de tarjeta o montos negativos, no gastos de consumo.</div>", unsafe_allow_html=True)
 
             if dup_count > 0:
                 st.markdown(f"<div class='info-strip'>⏭️ {dup_count} movimiento(s) ya existían y se omiten automáticamente.</div>", unsafe_allow_html=True)
@@ -784,6 +813,25 @@ with tabs[1]:
                     st.warning("Completá concepto y monto.")
 
     with st.expander("🗑️ Eliminar gastos"):
+        # Detectar automáticamente filas basura: pagos de tarjeta o montos <= 0
+        # que se hayan colado en importaciones anteriores (antes de este fix)
+        PALABRAS_EXCLUIR = ["su pago en pesos", "pago en pesos", "saldo anterior", "pago tarjeta"]
+        concepto_lower_g = gastos_df["Concepto"].astype(str).str.strip().str.lower()
+        gastos_monto_num = to_num(gastos_df["Monto"])
+        mask_basura = concepto_lower_g.isin(PALABRAS_EXCLUIR) | gastos_monto_num.le(0)
+        candidatos_basura = gastos_df[mask_basura]
+
+        if not candidatos_basura.empty:
+            st.markdown(f"<div class='info-strip'>⚠️ Se detectaron {len(candidatos_basura)} fila(s) que parecen pagos de tarjeta o montos inválidos, no gastos reales.</div>", unsafe_allow_html=True)
+            for idx, r in candidatos_basura.iterrows():
+                st.markdown(f"- **{r['Concepto']}** · {r['Fecha']} · {fmt_ars(r['Monto'])}")
+            if st.button(f"🧹 Eliminar {len(candidatos_basura)} fila(s) detectada(s)", key="clean_basura"):
+                gastos_df_limpio = gastos_df.drop(index=candidatos_basura.index).reset_index(drop=True)
+                save("gastos", gastos_df_limpio)
+                st.success("Limpieza completada.")
+                st.rerun()
+            st.divider()
+
         del_q = st.text_input("Buscar concepto", key="del_g", placeholder="Parte del concepto…")
         if del_q:
             cands = gastos_df[gastos_df["Concepto"].str.contains(del_q, case=False, na=False)]
@@ -861,7 +909,11 @@ with tabs[2]:
         key="editor_tarjetas"
     )
     if st.button("💾 Guardar tarjetas", key="save_t"):
-        save("tarjetas", edited_t.dropna(subset=["Nombre"]).reset_index(drop=True))
+        # Filtrar filas sin nombre real (vacías o con texto basura tipo "None")
+        edited_limpio = edited_t.copy()
+        edited_limpio["Nombre"] = edited_limpio["Nombre"].fillna("").astype(str).str.strip()
+        edited_limpio = edited_limpio[edited_limpio["Nombre"] != ""].reset_index(drop=True)
+        save("tarjetas", edited_limpio)
         st.success("Configuración guardada.")
         st.rerun()
 
