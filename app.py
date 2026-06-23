@@ -12,7 +12,11 @@ FILES = {
     "compartidos": ("mis_compartidos.csv", ["Fecha","Concepto","Monto","Con quien","Estado","Notas"]),
     "inversiones": ("mis_inversiones.csv", ["Fecha","Instrumento","Capital","Rendimiento","Moneda","Notas"]),
     "presupuesto": ("mis_presupuesto.csv", ["Categoria","Limite"]),
-    "tarjetas":    ("mis_tarjetas.csv",    ["Nombre","Dia cierre","Dia vencimiento","Color"]),
+    # "Proximo cierre" (fecha exacta YYYY-MM-DD) y "Dias entre cierres" (intervalo)
+    # permiten reflejar tarjetas cuyo ciclo NO cae el mismo día fijo cada mes
+    # (ej: Banco Hipotecario salta de 28/05 a 02/07). Si "Proximo cierre" está
+    # vacío, se usa el modo simple con "Dia cierre" fijo (compatibilidad vieja).
+    "tarjetas":    ("mis_tarjetas.csv",    ["Nombre","Dia cierre","Dia vencimiento","Color","Cierre anterior","Proximo cierre","Dias entre cierres"]),
 }
 
 CAT_GASTOS = ["🍔 Comida","🚗 Transporte","🎉 Salidas","✈️ Viaje","🏥 Salud",
@@ -108,7 +112,16 @@ def load(key):
         for c in cols:
             if c not in df.columns:
                 df[c] = ""
-        return df[cols]
+        df = df[cols]
+        # Normalizar SIEMPRE la columna Fecha al cargar, en cualquier archivo que
+        # la tenga. Antes esto solo se hacía manualmente en algunos puntos del
+        # código (después de cada load("gastos") suelto), y se olvidaba en otros
+        # (ej. gastos_fresh = load("gastos") en home), dejando fechas crudas tipo
+        # "11-Jun-2026" sin convertir a "2026-06-11" — eso rompía cualquier [:10]
+        # que truncaba a la mitad, y también el cálculo de período por tarjeta.
+        if "Fecha" in df.columns:
+            df["Fecha"] = df["Fecha"].apply(normalizar_fecha_existente)
+        return df
     return pd.DataFrame(columns=cols)
 
 def save(key, df):
@@ -169,6 +182,66 @@ def get_tarjetas_nombres():
                 nombres.append(t)
     return nombres
 
+def _generar_fechas_cierre(tarjeta_row, rango_dias=400):
+    """Genera la lista de fechas de cierre (date objects) para una tarjeta,
+    cubriendo desde `rango_dias` atrás hasta `rango_dias` adelante de hoy.
+
+    Modo nuevo (preferido): usa 'Cierre anterior' + 'Proximo cierre' (las DOS
+    fechas exactas que aparecen en el resumen real) para calcular el intervalo
+    REAL entre esos dos ciclos específicos, y lo repite hacia adelante/atrás.
+    Esto es necesario porque el intervalo entre cierres NO es constante en
+    algunos bancos (ej: Banco Hipotecario salta de 28/05 a 02/07 = 35 días,
+    no los 31 días "típicos") — anclar con un solo punto + intervalo fijo
+    genera fechas intermedias que no coinciden con la realidad.
+    Si solo hay 'Proximo cierre' (sin 'Cierre anterior'), usa 'Dias entre
+    cierres' como intervalo aproximado.
+    Si no hay 'Proximo cierre' configurado, devuelve None (caller usa modo
+    día-fijo viejo para no romper compatibilidad)."""
+    proximo_raw = str(tarjeta_row.get("Proximo cierre", "")).strip()
+    if not proximo_raw or proximo_raw.lower() in ("nan","none","s/f",""):
+        return None
+    try:
+        proximo = datetime.strptime(proximo_raw[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        try:
+            proximo = pd.to_datetime(proximo_raw, dayfirst=True).date()
+        except Exception:
+            return None
+
+    anterior_raw = str(tarjeta_row.get("Cierre anterior", "")).strip()
+    anterior = None
+    if anterior_raw and anterior_raw.lower() not in ("nan","none","s/f",""):
+        try:
+            anterior = datetime.strptime(anterior_raw[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            try:
+                anterior = pd.to_datetime(anterior_raw, dayfirst=True).date()
+            except Exception:
+                anterior = None
+
+    if anterior and anterior < proximo:
+        intervalo = (proximo - anterior).days
+    else:
+        intervalo = safe_int(tarjeta_row.get("Dias entre cierres", 31), 31)
+    if intervalo <= 0:
+        intervalo = 31
+
+    hoy = date.today()
+    fechas = [proximo]
+    if anterior:
+        fechas.append(anterior)
+    # Retroceder desde el punto ancla más antiguo conocido
+    f = anterior if anterior else proximo
+    while f > hoy - timedelta(days=rango_dias):
+        f = f - timedelta(days=intervalo)
+        fechas.append(f)
+    # Avanzar desde el próximo cierre conocido
+    f = proximo
+    while f < hoy + timedelta(days=rango_dias):
+        f = f + timedelta(days=intervalo)
+        fechas.append(f)
+    return sorted(set(fechas))
+
 def get_periodo_tarjeta(tarjeta_nombre, año=None, mes=None):
     t_df = load("tarjetas")
     hoy = date.today()
@@ -177,7 +250,25 @@ def get_periodo_tarjeta(tarjeta_nombre, año=None, mes=None):
     if t_df.empty or tarjeta_nombre not in t_df["Nombre"].values:
         return date(año, mes, 1), date(año, mes, calendar.monthrange(año, mes)[1])
     row = t_df[t_df["Nombre"] == tarjeta_nombre].iloc[0]
-    # Sin techo fijo en 28: se ajusta al último día real de cada mes más abajo
+
+    fechas_cierre = _generar_fechas_cierre(row)
+    if fechas_cierre:
+        # Modo fecha exacta: el período "del mes X" es el ciclo cuyo CIERRE
+        # cae en el mes/año X. Se busca esa fecha de cierre y la anterior.
+        objetivo = date(año, mes, min(28, calendar.monthrange(año, mes)[1]))
+        candidatas = [f for f in fechas_cierre if f.year == año and f.month == mes]
+        if candidatas:
+            fin = max(candidatas)
+        else:
+            # No hay cierre exacto en ese mes (puede saltarse un mes, como
+            # pasó de 28/05 a 02/07): tomar el cierre más próximo posterior
+            posteriores = [f for f in fechas_cierre if f >= objetivo]
+            fin = min(posteriores) if posteriores else max(fechas_cierre)
+        anteriores = [f for f in fechas_cierre if f < fin]
+        inicio = max(anteriores) + timedelta(days=1) if anteriores else fin - timedelta(days=30)
+        return inicio, fin
+
+    # Modo viejo (compatibilidad): día fijo todos los meses
     dia_cierre = safe_int(row.get("Dia cierre", 1), 1)
     mes_ant, año_ant = (12, año-1) if mes == 1 else (mes-1, año)
     ultimo_mes_ant = calendar.monthrange(año_ant, mes_ant)[1]
@@ -208,8 +299,18 @@ def periodo_actual_de_gasto(fecha_str, tarjeta_nombre):
     if t_df.empty or tarjeta_nombre not in t_df["Nombre"].values:
         return fg.year, fg.month
     row = t_df[t_df["Nombre"] == tarjeta_nombre].iloc[0]
-    # Sin techo fijo en 28: si el mes del gasto tiene menos días que el cierre
-    # configurado (ej. cierre=31 en febrero), se ajusta al último día real de ESE mes
+
+    fechas_cierre = _generar_fechas_cierre(row)
+    if fechas_cierre:
+        # El gasto pertenece al ciclo cuyo cierre es la primera fecha >= fecha del gasto
+        posteriores = [f for f in fechas_cierre if f >= fg]
+        if posteriores:
+            cierre_del_ciclo = min(posteriores)
+            return cierre_del_ciclo.year, cierre_del_ciclo.month
+        # Si no hay cierre futuro generado (gasto muy lejano), usar su propio mes
+        return fg.year, fg.month
+
+    # Modo viejo (compatibilidad): día fijo todos los meses
     dia_cierre_raw = safe_int(row.get("Dia cierre", 1), 1)
     ultimo_dia_mes_gasto = calendar.monthrange(fg.year, fg.month)[1]
     dia_cierre = min(dia_cierre_raw, ultimo_dia_mes_gasto)
@@ -607,7 +708,10 @@ with tabs[0]:
     else:
         for _, r in recientes.iterrows():
             ico = emoji_cat(str(r.get("Categoria","💳")))
-            fecha_str = str(r.get("Fecha",""))[:10]
+            # No truncar el string crudo con [:10] — si la fecha no está en formato
+            # ISO (ej: viene como "11-Jun-2026", 12 caracteres), cortar a 10 caracteres
+            # corta el año a la mitad ("11-Jun-202"). Se normaliza siempre antes de mostrar.
+            fecha_str = normalizar_fecha_existente(r.get("Fecha","")) or "sin fecha"
             tname_r = str(r.get("Tarjeta",""))
             cuotas_v = safe_int(r.get("Cuotas",1), 1)
             cuotas_t = f" · {cuotas_v}c" if cuotas_v > 1 else ""
@@ -934,10 +1038,10 @@ with tabs[2]:
         )
         if st.button("⚡ Configurar mis 3 tarjetas con un click", key="setup_rapido"):
             config_rapida = pd.DataFrame([
-                ["Visa ICBC",        28, 10, "#7c6af7"],
-                ["Visa Hipotecario", 28,  5, "#4ade80"],
-                ["Master ICBC",      28, 10, "#f87171"],
-            ], columns=["Nombre","Dia cierre","Dia vencimiento","Color"])
+                ["Visa ICBC",        28, 10, "#7c6af7", "", "", 31],
+                ["Visa Hipotecario", 28,  5, "#4ade80", "", "", 31],
+                ["Master ICBC",      28, 10, "#f87171", "", "", 31],
+            ], columns=["Nombre","Dia cierre","Dia vencimiento","Color","Cierre anterior","Proximo cierre","Dias entre cierres"])
             # Conservar tarjetas existentes que no estén en esta lista
             nombres_config = config_rapida["Nombre"].tolist()
             resto = tarjetas_df[~tarjetas_df["Nombre"].isin(nombres_config)] if not tarjetas_df.empty else pd.DataFrame(columns=config_rapida.columns)
@@ -949,19 +1053,31 @@ with tabs[2]:
 
     # ABM siempre visible, incluso si está vacío (se puede agregar con num_rows="dynamic")
     if tarjetas_df.empty:
-        tarjetas_edit = pd.DataFrame(columns=["Nombre","Dia cierre","Dia vencimiento","Color"])
+        tarjetas_edit = pd.DataFrame(columns=["Nombre","Dia cierre","Dia vencimiento","Color","Cierre anterior","Proximo cierre","Dias entre cierres"])
     else:
         tarjetas_edit = tarjetas_df.copy()
-    tarjetas_edit["Dia cierre"]      = pd.to_numeric(tarjetas_edit["Dia cierre"], errors="coerce").fillna(5).astype(int)
-    tarjetas_edit["Dia vencimiento"] = pd.to_numeric(tarjetas_edit["Dia vencimiento"], errors="coerce").fillna(20).astype(int)
-    tarjetas_edit["Nombre"]          = tarjetas_edit["Nombre"].fillna("").astype(str)
-    tarjetas_edit["Color"]           = tarjetas_edit["Color"].fillna("#7c6af7").astype(str)
+    tarjetas_edit["Dia cierre"]          = pd.to_numeric(tarjetas_edit["Dia cierre"], errors="coerce").fillna(5).astype(int)
+    tarjetas_edit["Dia vencimiento"]     = pd.to_numeric(tarjetas_edit["Dia vencimiento"], errors="coerce").fillna(20).astype(int)
+    tarjetas_edit["Nombre"]              = tarjetas_edit["Nombre"].fillna("").astype(str)
+    tarjetas_edit["Color"]               = tarjetas_edit["Color"].fillna("#7c6af7").astype(str)
+    tarjetas_edit["Cierre anterior"]     = tarjetas_edit["Cierre anterior"].apply(
+        lambda x: pd.to_datetime(x, errors="coerce").date() if str(x).strip() not in ("", "nan", "none", "s/f") else None
+    )
+    tarjetas_edit["Proximo cierre"]      = tarjetas_edit["Proximo cierre"].apply(
+        lambda x: pd.to_datetime(x, errors="coerce").date() if str(x).strip() not in ("", "nan", "none", "s/f") else None
+    )
+    tarjetas_edit["Dias entre cierres"]  = pd.to_numeric(tarjetas_edit["Dias entre cierres"], errors="coerce").fillna(31).astype(int)
 
     st.markdown(
-        "<div class='info-strip'>Editá o agregá filas acá. <strong>Día cierre</strong> y "
-        "<strong>Día vence</strong> son el mismo número todos los meses (ej: si tu tarjeta "
-        "cierra el 28, va a cerrar el 28 de enero, de febrero, de todos los meses — no se elige "
-        "un mes puntual). Los colores van en hex (#7c6af7). Luego guardá.</div>",
+        "<div class='info-strip'>Hay 2 formas de configurar el ciclo:<br>"
+        "<strong>① Simple:</strong> completá solo <strong>Día cierre</strong> y <strong>Día vence</strong> "
+        "(mismo número todos los meses).<br>"
+        "<strong>② Exacta (recomendada si el cierre no es siempre el mismo día, ej. Banco Hipotecario):</strong> "
+        "completá <strong>Cierre anterior</strong> y <strong>Próximo cierre</strong> con las 2 fechas exactas "
+        "que dice tu resumen ('CIERRE ANTERIOR' y 'PRÓXIMO CIERRE'). Con esas 2 fechas reales se calcula el "
+        "intervalo real entre ciclos — sin necesidad de adivinar. Si solo completás 'Próximo cierre' sin la "
+        "anterior, se usa 'Días entre cierres' como aproximación. Esto tiene prioridad sobre el modo simple. "
+        "Los colores van en hex (#7c6af7). Luego guardá.</div>",
         unsafe_allow_html=True
     )
     edited_t = st.data_editor(
@@ -969,10 +1085,13 @@ with tabs[2]:
         num_rows="dynamic",
         use_container_width=True,
         column_config={
-            "Nombre":          st.column_config.TextColumn("Nombre"),
-            "Dia cierre":      st.column_config.NumberColumn("Día cierre", min_value=1, max_value=31, step=1),
-            "Dia vencimiento": st.column_config.NumberColumn("Día vence", min_value=1, max_value=31, step=1),
-            "Color":           st.column_config.SelectboxColumn("Color", options=["#7c6af7","#4ade80","#f87171","#fbbf24","#60a5fa","#f472b6","#34d399","#fb923c"]),
+            "Nombre":             st.column_config.TextColumn("Nombre"),
+            "Dia cierre":         st.column_config.NumberColumn("Día cierre (simple)", min_value=1, max_value=31, step=1),
+            "Dia vencimiento":    st.column_config.NumberColumn("Día vence (simple)", min_value=1, max_value=31, step=1),
+            "Cierre anterior":    st.column_config.DateColumn("Cierre anterior (exacto)"),
+            "Proximo cierre":     st.column_config.DateColumn("Próximo cierre (exacto)"),
+            "Dias entre cierres": st.column_config.NumberColumn("Días entre cierres (si no hay anterior)", min_value=20, max_value=45, step=1),
+            "Color":              st.column_config.SelectboxColumn("Color", options=["#7c6af7","#4ade80","#f87171","#fbbf24","#60a5fa","#f472b6","#34d399","#fb923c"]),
         },
         key="editor_tarjetas"
     )
@@ -981,6 +1100,12 @@ with tabs[2]:
         edited_limpio = edited_t.copy()
         edited_limpio["Nombre"] = edited_limpio["Nombre"].fillna("").astype(str).str.strip()
         edited_limpio = edited_limpio[edited_limpio["Nombre"] != ""].reset_index(drop=True)
+        edited_limpio["Cierre anterior"] = edited_limpio["Cierre anterior"].apply(
+            lambda x: fmt_fecha(x) if pd.notnull(x) else ""
+        )
+        edited_limpio["Proximo cierre"] = edited_limpio["Proximo cierre"].apply(
+            lambda x: fmt_fecha(x) if pd.notnull(x) else ""
+        )
         save("tarjetas", edited_limpio)
         st.success("Configuración guardada.")
         st.rerun()
