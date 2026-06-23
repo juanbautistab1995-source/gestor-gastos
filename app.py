@@ -562,12 +562,15 @@ with tabs[0]:
     gastos_fresh["Monto"] = to_num(gastos_fresh["Monto"])
     gastos_fresh = sort_by_fecha(gastos_fresh)
 
-    # Resumen tarjetas — mes calendario, datos frescos del disco
-    st.markdown("<div class='sec'>Esta quincena / período</div>", unsafe_allow_html=True)
-    gastos_mes_fresh = filtrar_mes(gastos_fresh, y, m)
+    # Resumen tarjetas — usa el PERÍODO REAL de cada tarjeta (cierre/vencimiento),
+    # no el mes calendario. Antes esto usaba filtrar_mes() que ignoraba la
+    # configuración de Día de cierre, dejando afuera tarjetas cuyo ciclo
+    # no coincide con el mes calendario (ej: gastos del 31-may que pertenecen
+    # al período de junio si la tarjeta cierra el 28).
+    st.markdown("<div class='sec'>Este período (según cierre de cada tarjeta)</div>", unsafe_allow_html=True)
     tarjetas_con_gasto = {}
     for tname in TARJETAS:
-        gf = gastos_mes_fresh[gastos_mes_fresh["Tarjeta"] == tname]
+        gf = filtrar_gastos_tarjeta_periodo(gastos_fresh, tname, y, m)
         total_t = gf["Monto"].sum() if not gf.empty else 0
         if total_t > 0:
             tarjetas_con_gasto[tname] = total_t
@@ -954,7 +957,13 @@ with tabs[2]:
     tarjetas_edit["Nombre"]          = tarjetas_edit["Nombre"].fillna("").astype(str)
     tarjetas_edit["Color"]           = tarjetas_edit["Color"].fillna("#7c6af7").astype(str)
 
-    st.markdown("<div class='info-strip'>Editá o agregá filas acá. Los colores van en hex (#7c6af7). Luego guardá.</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='info-strip'>Editá o agregá filas acá. <strong>Día cierre</strong> y "
+        "<strong>Día vence</strong> son el mismo número todos los meses (ej: si tu tarjeta "
+        "cierra el 28, va a cerrar el 28 de enero, de febrero, de todos los meses — no se elige "
+        "un mes puntual). Los colores van en hex (#7c6af7). Luego guardá.</div>",
+        unsafe_allow_html=True
+    )
     edited_t = st.data_editor(
         tarjetas_edit,
         num_rows="dynamic",
@@ -979,13 +988,23 @@ with tabs[2]:
     st.markdown("<div class='sec'>Gastos por tarjeta y período</div>", unsafe_allow_html=True)
     c1,c2 = st.columns(2)
     t_sel = c1.selectbox("Tarjeta", TARJETAS, key="t_sel_tab")
+
+    # El nombre del período (ej "Jun 2026") es el mes en que CIERRA ese ciclo,
+    # no el mes calendario de los gastos. Para que quede claro, cada opción
+    # del selector muestra también el rango real de fechas que incluye
+    # (ej: "Jun 2026 · 29/05→28/06"), calculado con el cierre de la tarjeta elegida.
     periodos = []
     for delta in range(-5, 2):
         pm,py = m+delta, y
         while pm <= 0: pm+=12; py-=1
         while pm > 12: pm-=12; py+=1
         periodos.append((py,pm))
-    opciones_per = [f"{calendar.month_name[pm][:3]} {py}" for py,pm in periodos]
+
+    opciones_per = []
+    for py, pm in periodos:
+        ini, fin = get_periodo_tarjeta(t_sel, py, pm)
+        opciones_per.append(f"{calendar.month_name[pm][:3]} {py} · {ini.strftime('%d/%m')}→{fin.strftime('%d/%m')}")
+
     per_sel = c2.selectbox("Período", opciones_per, index=5, key="per_sel_tab")
     sel_py, sel_pm = periodos[opciones_per.index(per_sel)]
 
@@ -1004,6 +1023,7 @@ with tabs[2]:
     elif _key_ids not in st.session_state:
         st.session_state[_key_ids] = []
     total_per = to_num(df_per["Monto"]).sum() if not df_per.empty else 0
+
 
     hoy_d = date.today()
     if fin_p < hoy_d:
