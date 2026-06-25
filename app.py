@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+import re
 from datetime import date, datetime, timedelta
 import calendar
 import io
@@ -639,6 +640,67 @@ def es_duplicado_vectorizado(nuevos_df, gastos_existentes):
         resultado.append(es_dup)
     return pd.Series(resultado, index=nuevos_df.index)
 
+# ── Detección de duplicados "sospechosos" (no exactos, requieren revisión) ────
+# El detector de arriba exige Tarjeta+Fecha+Concepto+Monto casi exactos, así
+# que se le escapan dos patrones reales que aparecieron en uso: (1) la misma
+# compra cargada una vez en USD (con conversión automática a ARS) y otra vez
+# en ARS a mano, con montos distintos pero mismo concepto+fecha; y (2) la
+# misma compra cargada dos veces con 1-2 días de diferencia de fecha por
+# error de tipeo. Estos NO se auto-excluyen (a diferencia de duplicados
+# exactos) — se listan para que el usuario decida, porque podrían ser
+# compras genuinamente distintas.
+def _concepto_base_sin_usd(concepto):
+    """Quita el sufijo '(U$S)' para poder comparar la versión en dólares
+    contra la versión ya convertida a pesos del mismo concepto."""
+    s = _normalizar_texto(concepto)
+    return re.sub(r'\(\s*u\$s\s*\)\s*$', '', s).strip()
+
+def detectar_duplicados_usd_ars(gastos_df):
+    """Busca pares: mismo concepto base (ignorando '(U$S)') + misma fecha +
+    EXACTAMENTE 2 filas, una marcada USD y otra no. Es deliberadamente
+    estricto (exactamente 2, una de cada tipo) para no confundir compras
+    genuinamente distintas del mismo gateway de pago el mismo día (ej. varios
+    consumos de MERPAGO*EBANXSA en la misma fecha, que son normales)."""
+    if gastos_df.empty:
+        return []
+    df = gastos_df.copy()
+    df["_concepto_base"] = df["Concepto"].apply(_concepto_base_sin_usd)
+    df["_es_usd"] = df["Concepto"].apply(es_concepto_usd)
+    sospechosos = []
+    for (concepto, fecha), sub in df.groupby(["_concepto_base", "Fecha"]):
+        if len(sub) == 2 and sub["_es_usd"].sum() == 1:
+            sospechosos.append(sub)
+    return sospechosos
+
+def detectar_duplicados_fecha_cercana(gastos_df, ventana_dias=3):
+    """Busca pares: mismo concepto EXACTO + mismo monto EXACTO (tolerancia
+    $1) + fechas distintas pero separadas por pocos días. Cubre el caso de
+    cargar la misma compra dos veces con un error de tipeo en el día."""
+    if gastos_df.empty:
+        return []
+    df = gastos_df.copy().reset_index(drop=True)
+    df["_concepto_norm"] = df["Concepto"].apply(_normalizar_texto)
+    df["_fecha_dt"] = pd.to_datetime(df["Fecha"], errors="coerce")
+    df = df[df["_fecha_dt"].notna()]
+    grupos_vistos = set()
+    sospechosos = []
+    for i, r1 in df.iterrows():
+        if i in grupos_vistos:
+            continue
+        similares = df[
+            (df["_concepto_norm"] == r1["_concepto_norm"]) &
+            (abs(df["Monto"] - r1["Monto"]) < 1.0) &
+            (abs((df["_fecha_dt"] - r1["_fecha_dt"]).dt.days) <= ventana_dias) &
+            (df["_fecha_dt"] != r1["_fecha_dt"]) &
+            (df.index != i)
+        ]
+        if not similares.empty:
+            grupo_idx = [i] + list(similares.index)
+            if not any(idx in grupos_vistos for idx in grupo_idx):
+                sospechosos.append(df.loc[grupo_idx])
+                grupos_vistos.update(grupo_idx)
+    return sospechosos
+
 # ── CSS ────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Biyuyo", layout="centered", initial_sidebar_state="collapsed")
 
@@ -1152,6 +1214,45 @@ with tabs[1]:
                     st.rerun()
                 else:
                     st.warning("Completá concepto y monto.")
+
+    with st.expander("🔍 Revisar posibles duplicados"):
+        st.markdown(
+            "<div class='info-strip'>Busca patrones que el detector automático de importación "
+            "no cacha: la misma compra cargada en USD y en ARS por separado, o cargada dos veces "
+            "con 1-3 días de diferencia. No se borra nada solo — revisá y decidí.</div>",
+            unsafe_allow_html=True
+        )
+        sospechosos_usd = detectar_duplicados_usd_ars(gastos_df)
+        sospechosos_fecha = detectar_duplicados_fecha_cercana(gastos_df)
+
+        if not sospechosos_usd and not sospechosos_fecha:
+            st.caption("No se encontraron patrones sospechosos.")
+        else:
+            if sospechosos_usd:
+                st.markdown("**💵 Misma compra en USD y en ARS:**")
+                for grupo in sospechosos_usd:
+                    for idx, r in grupo.iterrows():
+                        ca, cb = st.columns([5, 1])
+                        ca.markdown(f"`{r['Fecha']}` **{r['Concepto']}** · {fmt_ars(r['Monto'])}")
+                        with cb:
+                            if st.button("✕", key=f"dup_usd_{idx}"):
+                                gastos_df = gastos_df.drop(index=idx).reset_index(drop=True)
+                                save("gastos", gastos_df)
+                                st.rerun()
+                    st.divider()
+
+            if sospechosos_fecha:
+                st.markdown("**📅 Mismo monto y concepto, fecha cercana:**")
+                for grupo in sospechosos_fecha:
+                    for idx, r in grupo.iterrows():
+                        ca, cb = st.columns([5, 1])
+                        ca.markdown(f"`{r['Fecha']}` **{r['Concepto']}** · {fmt_ars(r['Monto'])}")
+                        with cb:
+                            if st.button("✕", key=f"dup_fec_{idx}"):
+                                gastos_df = gastos_df.drop(index=idx).reset_index(drop=True)
+                                save("gastos", gastos_df)
+                                st.rerun()
+                    st.divider()
 
     with st.expander("🗑️ Eliminar gastos"):
         PALABRAS_EXCLUIR = ["su pago en pesos", "pago en pesos", "saldo anterior", "pago tarjeta"]
