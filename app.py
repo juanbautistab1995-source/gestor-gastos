@@ -49,6 +49,10 @@ FILES = {
     # (ej: Banco Hipotecario salta de 28/05 a 02/07). Si "Proximo cierre" está
     # vacío, se usa el modo simple con "Dia cierre" fijo (compatibilidad vieja).
     "tarjetas": ("mis_tarjetas.csv", ["Nombre","Dia cierre","Dia vencimiento","Color","Cierre anterior","Proximo cierre","Dias entre cierres"]),
+    # Log de auditoría: registra ediciones de Fecha/Monto sobre gastos ya
+    # existentes (no altas nuevas), para poder rastrear si una cuota se
+    # "movió" de período por una corrección manual o por error de tipeo.
+    "historial": ("historial_cambios.csv", ["Timestamp","Concepto","Campo","Valor anterior","Valor nuevo","Tarjeta"]),
 }
 
 CAT_GASTOS = ["🍔 Comida","🚗 Transporte","🎉 Salidas","✈️ Viaje","🏥 Salud",
@@ -217,6 +221,48 @@ def sort_by_fecha(df):
     df["_sort"] = pd.to_datetime(df["Fecha"], errors="coerce")
     df = df.sort_values("_sort", ascending=False, na_position="last").drop(columns=["_sort"])
     return df
+
+# ── Historial de cambios (auditoría de ediciones manuales) ─────────────────────
+# A pedido explícito: cada cuota es independiente y NO se recalculan las demás
+# al editar una. Para no perder trazabilidad si una fecha se corrige (o se
+# mueve por error), se guarda un log aparte con valor anterior/nuevo. Esto NO
+# cambia ningún comportamiento existente — es solo un registro de auditoría.
+def detectar_cambios_fecha_monto(df_antes_con_id, df_despues, campos=("Fecha", "Monto")):
+    """Compara, POSICIÓN A POSICIÓN, las filas que ya existían en el período
+    (df_antes_con_id, tal como se le pasó al data_editor) contra lo que el
+    usuario guardó (df_despues). Streamlit conserva el orden de las filas
+    preexistentes aunque se agreguen o borren otras, así que alinear por
+    posición hasta min(len(antes), len(despues)) es seguro: filas nuevas
+    agregadas por el usuario quedan al final y no se comparan (son altas,
+    no ediciones). Devuelve lista de dicts listos para el CSV de historial."""
+    cambios = []
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    n = min(len(df_antes_con_id), len(df_despues))
+    for i in range(n):
+        fila_antes = df_antes_con_id.iloc[i]
+        fila_despues = df_despues.iloc[i]
+        for campo in campos:
+            v_antes = str(fila_antes.get(campo, "")).strip()
+            v_despues = str(fila_despues.get(campo, "")).strip()
+            if v_antes != v_despues:
+                cambios.append({
+                    "Timestamp": ts,
+                    "Concepto": fila_antes.get("Concepto", "?"),
+                    "Campo": campo,
+                    "Valor anterior": v_antes,
+                    "Valor nuevo": v_despues,
+                    "Tarjeta": fila_antes.get("Tarjeta", "?"),
+                })
+    return cambios
+
+def registrar_historial(cambios):
+    """Agrega filas nuevas al CSV de historial (append, nunca sobreescribe)."""
+    if not cambios:
+        return
+    nuevas = pd.DataFrame(cambios, columns=FILES["historial"][1])
+    existente = load("historial")
+    final = pd.concat([existente, nuevas], ignore_index=True)
+    save("historial", final)
 
 # ── Cuotas: modelo de FILAS REALES (ver resumen del refactor arriba) ───────────
 def parsear_cuotas(val):
@@ -1224,7 +1270,11 @@ with tabs[2]:
             "(mismo número todos los meses).<br>"
             "<strong>② Exacta (recomendada si el cierre no es siempre el mismo día):</strong> "
             "completá <strong>Cierre anterior</strong> y <strong>Próximo cierre</strong> con las 2 fechas exactas "
-            "de tu resumen. Tiene prioridad sobre el modo simple.</div>",
+            "de tu resumen. Tiene prioridad sobre el modo simple — si están completas, el Día cierre simple "
+            "se ignora por completo para esa tarjeta.<br><br>"
+            "⚠️ <strong>Importante:</strong> cambiar estos valores afecta TODOS los períodos, pasados y "
+            "futuros — no hay forma de decir 'desde tal mes usá este día'. Si tu tarjeta cambió de día de "
+            "cierre en algún momento real, usá el modo Exacto con las 2 fechas de tu último resumen.</div>",
             unsafe_allow_html=True
         )
         edited_t = st.data_editor(
@@ -1242,20 +1292,63 @@ with tabs[2]:
             },
             key="editor_tarjetas"
         )
-        if st.button("💾 Guardar tarjetas", key="save_t"):
-            edited_limpio = edited_t.copy()
-            edited_limpio["Nombre"] = edited_limpio["Nombre"].fillna("").astype(str).str.strip()
-            edited_limpio = edited_limpio[edited_limpio["Nombre"] != ""].reset_index(drop=True)
-            edited_limpio["Cierre anterior"] = edited_limpio["Cierre anterior"].apply(
-                lambda x: fmt_fecha(x) if pd.notnull(x) else ""
-            )
-            edited_limpio["Proximo cierre"] = edited_limpio["Proximo cierre"].apply(
-                lambda x: fmt_fecha(x) if pd.notnull(x) else ""
-            )
-            save("tarjetas", edited_limpio)
-            listar_ciclos_tarjeta.clear()  # invalidar cache de ciclos tras cambiar config
-            st.success("Configuración guardada.")
-            st.rerun()
+
+        # FIX: validación de coherencia. Si "Cierre anterior" y "Próximo cierre"
+        # están completos pero el intervalo entre ellos no es un mes razonable
+        # (28-35 días), avisar ANTES de guardar — un error de tipeo en estas
+        # fechas (como pasó con Visa ICBC: un intervalo corto) desincroniza
+        # todos los períodos siguientes sin que se note hasta semanas después.
+        avisos_coherencia = []
+        for _, row_t in edited_t.iterrows():
+            nombre_t = str(row_t.get("Nombre", "")).strip()
+            ant = row_t.get("Cierre anterior")
+            prox = row_t.get("Proximo cierre")
+            if nombre_t and pd.notnull(ant) and pd.notnull(prox):
+                try:
+                    intervalo_dias = (prox - ant).days
+                except TypeError:
+                    intervalo_dias = None
+                if intervalo_dias is not None and not (27 <= intervalo_dias <= 36):
+                    avisos_coherencia.append((nombre_t, intervalo_dias, ant, prox))
+
+        if avisos_coherencia:
+            for nombre_t, intervalo_dias, ant, prox in avisos_coherencia:
+                st.markdown(
+                    f"<div class='warn-strip'>⚠️ <b>{nombre_t}</b>: entre {ant} y {prox} hay "
+                    f"{intervalo_dias} días — no es un mes típico (28-35 días). Si esto no es a "
+                    f"propósito, revisá esas 2 fechas antes de guardar; un intervalo incorrecto "
+                    f"acá desincroniza los períodos siguientes.</div>",
+                    unsafe_allow_html=True
+                )
+
+        c_save, c_clear = st.columns(2)
+        with c_save:
+            if st.button("💾 Guardar tarjetas", key="save_t"):
+                edited_limpio = edited_t.copy()
+                edited_limpio["Nombre"] = edited_limpio["Nombre"].fillna("").astype(str).str.strip()
+                edited_limpio = edited_limpio[edited_limpio["Nombre"] != ""].reset_index(drop=True)
+                edited_limpio["Cierre anterior"] = edited_limpio["Cierre anterior"].apply(
+                    lambda x: fmt_fecha(x) if pd.notnull(x) else ""
+                )
+                edited_limpio["Proximo cierre"] = edited_limpio["Proximo cierre"].apply(
+                    lambda x: fmt_fecha(x) if pd.notnull(x) else ""
+                )
+                save("tarjetas", edited_limpio)
+                listar_ciclos_tarjeta.clear()  # invalidar cache de ciclos tras cambiar config
+                st.success("Configuración guardada.")
+                st.rerun()
+        with c_clear:
+            tarjeta_a_limpiar = st.selectbox("Volver a modo simple en…", ["—"] + tarjetas_edit["Nombre"].tolist(), key="tarjeta_limpiar_sel", label_visibility="collapsed")
+            if st.button("🧽 Borrar fechas exactas", key="clear_modo_exacto"):
+                if tarjeta_a_limpiar != "—":
+                    base_t = load("tarjetas")
+                    mask_t = base_t["Nombre"].astype(str).str.strip() == tarjeta_a_limpiar.strip()
+                    base_t.loc[mask_t, "Cierre anterior"] = ""
+                    base_t.loc[mask_t, "Proximo cierre"] = ""
+                    save("tarjetas", base_t)
+                    listar_ciclos_tarjeta.clear()
+                    st.success(f"{tarjeta_a_limpiar} vuelve al modo simple (Día cierre).")
+                    st.rerun()
 
     st.markdown("<div class='sec'>Gastos por tarjeta y período</div>", unsafe_allow_html=True)
     t_sel = st.selectbox("Tarjeta", TARJETAS, key="t_sel_tab")
@@ -1295,14 +1388,13 @@ with tabs[2]:
         f"<div class='per-badge {badge_class}'>{badge_ico} · {inicio_p.strftime('%d/%m')} → {fin_p.strftime('%d/%m')}</div>",
         unsafe_allow_html=True)
 
-    color_t_sel = get_color_tarjeta(t_sel, tarjetas_df)
-    st.markdown(
-        "<div class='total-strip'>"
-        f"<span class='total-strip-label'>{t_sel} · este período</span>"
-        f"<span class='total-strip-val' style='color:{color_t_sel}'>−{fmt_ars(total_per)}</span>"
-        "</div>", unsafe_allow_html=True)
-
     if df_per.empty:
+        color_t_sel = get_color_tarjeta(t_sel, tarjetas_df)
+        st.markdown(
+            "<div class='total-strip'>"
+            f"<span class='total-strip-label'>{t_sel} · este período</span>"
+            f"<span class='total-strip-val' style='color:{color_t_sel}'>−{fmt_ars(total_per)}</span>"
+            "</div>", unsafe_allow_html=True)
         st.markdown("<div class='empty'><big>💳</big>Sin gastos en este período.</div>", unsafe_allow_html=True)
     else:
         # _row_id = posición exacta en el CSV completo (0-indexed), estable
@@ -1352,6 +1444,18 @@ with tabs[2]:
             key=f"editor_per_{t_sel}_{inicio_p}_{fin_p}"
         )
 
+        # Total recalculado en vivo desde la tabla editada (no desde el disco),
+        # y ubicado DEBAJO de la tabla — antes estaba arriba, donde la barra
+        # de herramientas flotante del data_editor (lupa/descarga/expandir) lo
+        # tapaba visualmente en pantallas chicas.
+        total_per_editado = pd.to_numeric(edited_per["Monto"], errors="coerce").fillna(0).sum()
+        color_t_sel = get_color_tarjeta(t_sel, tarjetas_df)
+        st.markdown(
+            "<div class='total-strip'>"
+            f"<span class='total-strip-label'>{t_sel} · este período</span>"
+            f"<span class='total-strip-val' style='color:{color_t_sel}'>−{fmt_ars(total_per_editado)}</span>"
+            "</div>", unsafe_allow_html=True)
+
         if st.button("💾 Guardar cambios en gastos", key="save_per"):
             base = load("gastos")
             base["Monto"]           = to_num(base["Monto"])
@@ -1379,11 +1483,38 @@ with tabs[2]:
                     nuevas[col] = ""
             nuevas = nuevas[FILES["gastos"][1]]
 
+            # Historial de auditoría: detecta si Fecha o Monto cambiaron
+            # respecto a lo que había antes de editar (df_per_con_id), y lo
+            # registra en un log aparte. No cambia el guardado en sí — cada
+            # cuota sigue siendo independiente, esto es solo trazabilidad
+            # para poder rastrear después si una cuota "se movió" de período.
+            cambios_detectados = detectar_cambios_fecha_monto(df_per_con_id, nuevas)
+            if cambios_detectados:
+                registrar_historial(cambios_detectados)
+
             final = pd.concat([base_limpia, nuevas], ignore_index=True)
             final = sort_by_fecha(final)
             save("gastos", final)
-            st.success(f"✅ Guardado. {len(nuevas)} filas actualizadas.")
+            if cambios_detectados:
+                st.success(f"✅ Guardado. {len(nuevas)} filas actualizadas. {len(cambios_detectados)} cambio(s) registrado(s) en el historial.")
+            else:
+                st.success(f"✅ Guardado. {len(nuevas)} filas actualizadas.")
             st.rerun()
+
+    with st.expander("🕓 Historial de cambios (fecha/monto editados a mano)"):
+        hist_df = load("historial")
+        if hist_df.empty:
+            st.caption("Todavía no se registró ningún cambio de fecha o monto.")
+        else:
+            hist_df = hist_df.sort_values("Timestamp", ascending=False)
+            for _, hr in hist_df.head(50).iterrows():
+                st.markdown(
+                    f"<div class='tx-info' style='padding:0.4rem 1rem;border-bottom:1px solid #14141e'>"
+                    f"<b>{hr['Concepto']}</b> ({hr['Tarjeta']}) · {hr['Campo']}: "
+                    f"<span class='c-neg'>{hr['Valor anterior']}</span> → <span class='c-pos'>{hr['Valor nuevo']}</span>"
+                    f"<br><span style='color:#333'>{hr['Timestamp']}</span></div>",
+                    unsafe_allow_html=True
+                )
 
     # FIX PROBLEMA 3: botón de blanqueo repuesto, con dos modos.
     with st.expander("🧹 Blanquear tarjeta"):
