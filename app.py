@@ -1371,7 +1371,15 @@ with tabs[2]:
 
         df_ed["Fecha"]           = df_ed["Fecha"].apply(lambda x: pd.to_datetime(x, errors="coerce").date() if str(x) not in ("S/F","","nan") else None)
         df_ed["Monto"]           = pd.to_numeric(df_ed["Monto"], errors="coerce").fillna(0)
-        df_ed["Cuotas"]          = pd.to_numeric(df_ed["Cuotas"], errors="coerce").fillna(1).astype(int)
+        # FIX BUG C: la columna "Cuotas" del CSV es TEXTO ("Cuota 1/6"). Convertirla
+        # directo con pd.to_numeric (como se hacía antes) falla siempre y cae al
+        # default 1 — por eso el data_editor del período mostraba "1" en todas las
+        # filas con cuotas reales. Se separa en dos columnas numéricas editables
+        # usando parsear_cuotas(), que sí entiende ese formato de texto.
+        _cuotas_parseadas = df_ed["Cuotas"].apply(parsear_cuotas)
+        df_ed["Cuota actual"]    = _cuotas_parseadas.apply(lambda t: t[0])
+        df_ed["Cuota total"]     = _cuotas_parseadas.apply(lambda t: t[1])
+        df_ed = df_ed.drop(columns=["Cuotas"])
         df_ed["Cuanto recupero"] = pd.to_numeric(df_ed["Cuanto recupero"], errors="coerce").fillna(0)
         df_ed["Concepto"]        = df_ed["Concepto"].fillna("").astype(str)
         df_ed["Tarjeta"]         = df_ed["Tarjeta"].fillna("").astype(str)
@@ -1388,7 +1396,8 @@ with tabs[2]:
                 "Fecha":           st.column_config.DateColumn("Fecha"),
                 "Concepto":        st.column_config.TextColumn("Concepto"),
                 "Monto":           st.column_config.NumberColumn("Monto $", format="$%d", min_value=0),
-                "Cuotas":          st.column_config.NumberColumn("Cuotas", min_value=1, max_value=48, step=1),
+                "Cuota actual":    st.column_config.NumberColumn("Cuota actual", min_value=1, max_value=48, step=1, help="Qué número de cuota es esta, ej: 1 en 'Cuota 1/6'"),
+                "Cuota total":     st.column_config.NumberColumn("Cuota total", min_value=1, max_value=48, step=1, help="Cuántas cuotas tiene en total, ej: 6 en 'Cuota 1/6'"),
                 "Compartido":      st.column_config.TextColumn("Compartido"),
                 "Con quien":       st.column_config.TextColumn("Con quién"),
                 "Cuanto recupero": st.column_config.NumberColumn("Recupero $", format="$%d", min_value=0),
@@ -1425,6 +1434,13 @@ with tabs[2]:
             nuevas["Fecha"]           = nuevas["Fecha"].apply(fmt_fecha)
             nuevas["Monto"]           = to_num(nuevas["Monto"])
             nuevas["Cuanto recupero"] = to_num(nuevas["Cuanto recupero"])
+            # FIX BUG C (parte 2): reconstruir el texto "Cuota X/Y" a partir de
+            # las dos columnas numéricas editables, para guardarlo en el formato
+            # que el resto de la app espera en la columna Cuotas del CSV.
+            _cuota_act_col = pd.to_numeric(nuevas.get("Cuota actual", 1), errors="coerce").fillna(1).astype(int)
+            _cuota_tot_col = pd.to_numeric(nuevas.get("Cuota total", 1), errors="coerce").fillna(1).astype(int)
+            nuevas["Cuotas"] = [fmt_cuotas(a, t) for a, t in zip(_cuota_act_col, _cuota_tot_col)]
+            nuevas = nuevas.drop(columns=["Cuota actual", "Cuota total"], errors="ignore")
             for col in FILES["gastos"][1]:
                 if col not in nuevas.columns:
                     nuevas[col] = ""
