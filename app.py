@@ -30,8 +30,8 @@ TARJETAS_DEFAULT = ["Visa ICBC","Visa Hipotecario","Master ICBC","Efectivo","Dé
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 _MESES_ES = {
-    "ene":"01","feb":"02","mar":"03","abr":"04","may":"05","jun":"06",
-    "jul":"07","ago":"08","sep":"09","oct":"10","nov":"11","dic":"12",
+    "ene":"01", "feb":"02", "mar":"03", "abr":"04", "may":"05", "jun":"06",
+    "jul":"07", "ago":"08", "sep":"09", "oct":"10", "nov":"11", "dic":"12",
 }
 
 def _parsear_fecha_es(s):
@@ -594,6 +594,7 @@ html,body,[class*="css"],.stApp{font-family:'DM Sans',sans-serif!important;backg
 .empty{text-align:center;padding:2.5rem 1rem;color:#333;font-size:0.82rem;border-bottom:1px solid #14141e}
 .empty big{display:block;font-size:1.8rem;margin-bottom:0.5rem;opacity:0.4}
 .chip-next{display:inline-block;background:#6c63ff15;border:1px solid #6c63ff30;color:#6c63ff;border-radius:4px;font-size:0.6rem;padding:1px 5px;margin-left:5px;vertical-align:middle;font-family:'DM Mono',monospace}
+.chip-proy{display:inline-block;background:#f5c54215;border:1px solid #f5c54230;color:#f5c542;border-radius:4px;font-size:0.6rem;padding:1px 5px;margin-left:5px;vertical-align:middle;font-family:'DM Mono',monospace}
 div[data-testid="stButton"]>button,div[data-testid="stFormSubmitButton"]>button{background:#6c63ff!important;color:#fff!important;border:none!important;border-radius:8px!important;font-weight:600!important;font-size:0.82rem!important;padding:0.5rem 1rem!important;width:100%!important;font-family:'DM Sans',sans-serif!important;transition:background 0.15s!important}
 div[data-testid="stButton"]>button:hover,div[data-testid="stFormSubmitButton"]>button:hover{background:#5a52e0!important;color:#fff!important}
 .stTextInput input,.stNumberInput input,.stDateInput input,.stSelectbox div[data-baseweb="select"]>div,.stTextArea textarea{background:#0d0d18!important;border:1px solid #1e1e30!important;border-radius:8px!important;color:#dde0f0!important;font-size:0.88rem!important;font-family:'DM Sans',sans-serif!important}
@@ -851,8 +852,10 @@ with tabs[0]:
             # corta el año a la mitad ("11-Jun-202"). Se normaliza siempre antes de mostrar.
             fecha_str = normalizar_fecha_existente(r.get("Fecha","")) or "sin fecha"
             tname_r = str(r.get("Tarjeta",""))
-            cuotas_v = safe_int(r.get("Cuotas",1), 1)
-            cuotas_t = f" · {cuotas_v}c" if cuotas_v > 1 else ""
+            # FIX BUG A: usar parsear_cuotas (entiende "Cuota 1/6") en vez de
+            # safe_int (que no lo entiende y siempre devolvía 1 por default).
+            cuota_act_r, cuota_tot_r = parsear_cuotas(r.get("Cuotas", 1))
+            cuotas_t = f" · {cuota_act_r}/{cuota_tot_r}" if cuota_tot_r > 1 else ""
             # chip de período solo si la tarjeta tiene cierre configurado
             chip = ""
             if not tarjetas_df.empty and tname_r in tarjetas_df["Nombre"].values:
@@ -1160,8 +1163,9 @@ with tabs[1]:
         for _, r in gastos_df.head(st.session_state.gasto_limit).iterrows():
             ico = emoji_cat(str(r.get("Categoria","💳")))
             fstr = str(r.get("Fecha",""))[:10]
-            cuotas_v = safe_int(r.get("Cuotas",1), 1)
-            cuotas_t = f" · {cuotas_v}c" if cuotas_v > 1 else ""
+            # FIX BUG A: parsear_cuotas en vez de safe_int — ver nota en TAB 0
+            cuota_act, cuota_tot = parsear_cuotas(r.get("Cuotas", 1))
+            cuotas_t = f" · {cuota_act}/{cuota_tot}" if cuota_tot > 1 else ""
             comp_t   = f" · {r.get('Con quien','')}" if str(r.get("Compartido","No")) == "Sí" else ""
             st.markdown(
                 "<div class='tx'>"
@@ -1317,9 +1321,6 @@ with tabs[2]:
 
     # Total PROYECTADO: incluye cuotas futuras de compras hechas en OTROS meses
     # que caen en este período (ej: cuota 5/12 de una compra de hace 4 meses).
-    # Se calcula aparte del editor de filas reales porque esas cuotas futuras
-    # son virtuales — no existen como fila propia en el CSV, así que no se
-    # pueden editar/borrar individualmente acá (se edita la compra original).
     gastos_proyectado_tab = proyectar_cuotas(gastos_base.drop(columns=["_row_id"]))
     df_per_proyectado = filtrar_gastos_tarjeta_periodo(gastos_proyectado_tab, t_sel, sel_py, sel_pm)
     total_proyectado = to_num(df_per_proyectado["Monto"]).sum() if not df_per_proyectado.empty else 0
@@ -1344,11 +1345,23 @@ with tabs[2]:
         f"<span class='total-strip-label'>{t_sel} · {per_sel}</span>"
         f"<span class='total-strip-val' style='color:{color_t_sel}'>−{fmt_ars(total_proyectado)}</span>"
         "</div>", unsafe_allow_html=True)
+
+    # FIX BUG B: la tabla editable de abajo, antes, solo mostraba las compras
+    # ORIGINALES de este período (df_per) — las cuotas futuras de compras hechas
+    # en otros meses (ej: cuota 3/6 de NIKE, comprada en junio, cayendo en agosto)
+    # solo se usaban para el TOTAL de arriba pero nunca se veían en la lista.
+    # Ahora se muestran ambas en una sola tabla: las originales (editables) y
+    # las cuotas proyectadas de compras de otros meses (solo lectura, marcadas).
+    if not df_per_proyectado.empty:
+        filas_proyectadas_otros_meses = df_per_proyectado[df_per_proyectado.get("Es proyectada", False) == True].copy()
+    else:
+        filas_proyectadas_otros_meses = pd.DataFrame()
+
     if cant_cuotas_de_otros_meses > 0:
         st.markdown(
-            f"<div class='info-strip'>📋 Incluye {cant_cuotas_de_otros_meses} cuota(s) de compras hechas en otros meses. "
-            f"Las filas editables abajo muestran solo las {len(df_per)} compra(s) ORIGINAL(es) de este período "
-            f"(−{fmt_ars(total_per)}) — para ver/editar una cuota futura, buscá la compra original en su mes.</div>",
+            f"<div class='info-strip'>📋 Este período incluye {cant_cuotas_de_otros_meses} cuota(s) de compras hechas "
+            f"en otros meses (se muestran abajo marcadas como 🔁, solo lectura — para editarlas hay que ir al mes "
+            f"de la compra original).</div>",
             unsafe_allow_html=True
         )
 
@@ -1425,8 +1438,26 @@ with tabs[2]:
                 del st.session_state[_key_ids]
             st.success(f"✅ Guardado. {len(nuevas)} filas actualizadas.")
             st.rerun()
-    else:
+    elif filas_proyectadas_otros_meses.empty:
         st.markdown("<div class='empty'><big>💳</big>Sin gastos en este período.</div>", unsafe_allow_html=True)
+
+    # Cuotas proyectadas de compras hechas en otros meses: solo lectura,
+    # mostradas como lista (no como data_editor) porque no son filas reales
+    # del CSV — editarlas habría que hacerlo desde la compra original.
+    if not filas_proyectadas_otros_meses.empty:
+        st.markdown("<div class='sec'>🔁 Cuotas de compras de otros meses (solo lectura)</div>", unsafe_allow_html=True)
+        for _, r in filas_proyectadas_otros_meses.sort_values("Monto", ascending=False).iterrows():
+            c_act = int(r.get("Cuota actual", 1))
+            c_tot = int(r.get("Cuota total", 1))
+            st.markdown(
+                "<div class='tx'>"
+                f"<div class='tx-ico'>{emoji_cat(str(r.get('Categoria','💳')))}</div>"
+                "<div class='tx-main'>"
+                f"<div class='tx-name'>{r.get('Concepto','—')}<span class='chip-proy'>🔁 {c_act}/{c_tot}</span></div>"
+                f"<div class='tx-info'>{r.get('Tarjeta','')} · compra original distinta a este período</div>"
+                "</div>"
+                f"<div class='tx-amt c-neg'>−{fmt_ars(r.get('Monto',0))}</div>"
+                "</div>", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
