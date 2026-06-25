@@ -1,3 +1,4 @@
+```python
 import streamlit as st
 import pandas as pd
 import os
@@ -54,7 +55,7 @@ def to_num(series):
     return pd.to_numeric(pd.Series(series).astype(str).str.replace(r"[^\d\.\-]", "", regex=True), errors="coerce").fillna(0)
 
 # ==========================================
-# 3. LÓGICA CORE (RECONSTRUIDA DEL PDF)
+# 3. LÓGICA CORE
 # ==========================================
 def fmt_ars(val):
     return f"$ {val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -67,7 +68,7 @@ def get_color_tarjeta(tname, df_tarjetas):
         return "#888888"
 
 def obtener_periodo_resumen(fecha_str, tname, t_dict):
-    """Asigna un gasto a su mes de RESUMEN exacto (Cruza el día de compra con el día de cierre)."""
+    """Asigna un gasto a su mes de RESUMEN exacto cruzando la compra con el cierre de tarjeta."""
     try:
         dt = pd.to_datetime(fecha_str).date()
     except:
@@ -80,7 +81,6 @@ def obtener_periodo_resumen(fecha_str, tname, t_dict):
     if tname_str in t_dict:
         row = t_dict[tname_str]
         
-        # Modo simple: Dia de cierre
         try:
             dia_cierre = int(float(str(row.get("Dia cierre", 0))))
         except:
@@ -88,7 +88,7 @@ def obtener_periodo_resumen(fecha_str, tname, t_dict):
             
         if dia_cierre > 0:
             cierre_real = min(dia_cierre, calendar.monthrange(dt.year, dt.month)[1])
-            # Si compro DESPUÉS del cierre, entra en el resumen del mes que viene
+            # Si el gasto entró después del día de cierre, impacta en el resumen del mes siguiente
             if dt.day > cierre_real:
                 if dt.month == 12:
                     return dt.year + 1, 1
@@ -98,7 +98,7 @@ def obtener_periodo_resumen(fecha_str, tname, t_dict):
     return dt.year, dt.month
 
 def procesar_gastos_con_periodos(df_gastos, df_tarjetas):
-    """Enriquece el DF con los periodos para cruzar Home y Tarjetas de manera idéntica."""
+    """Aplica la lógica de periodos de resumen a toda la base para mantener Home y Tarjetas sincronizados."""
     if df_gastos.empty:
         df_gastos["Periodo_Año"] = []
         df_gastos["Periodo_Mes"] = []
@@ -125,9 +125,10 @@ def filtrar_gastos_tarjeta_periodo(df_completo, tname, py, pm):
                        (df_completo["Periodo_Mes"] == pm)]
 
 # ==========================================
-# 4. EXPANSIÓN FÍSICA DE CUOTAS (NUEVO FIX)
+# 4. EXPANSIÓN FÍSICA DE CUOTAS
 # ==========================================
 def registrar_gasto_expandido(fecha, concepto, monto_total, tarjeta, cuotas, categoria, con_quien, notas):
+    """Si el gasto es en cuotas, inyecta N filas adelantando el mes calendario. Chau proyecciones volátiles."""
     df = load("gastos")
     nuevas = []
     
@@ -138,7 +139,7 @@ def registrar_gasto_expandido(fecha, concepto, monto_total, tarjeta, cuotas, cat
     fecha_base = pd.to_datetime(fecha).date()
     
     for i in range(1, ctas_int + 1):
-        # Adelantamos calendario físico
+        # Avanzar meses según el número de cuota
         mes_avance = fecha_base.month - 1 + (i - 1)
         año_i = fecha_base.year + (mes_avance // 12)
         mes_i = (mes_avance % 12) + 1
@@ -178,7 +179,7 @@ ingresos_df["Monto_Num"] = to_num(ingresos_df["Monto"])
 lista_tarjetas = ["Efectivo", "Débito"] + list(tarjetas_df["Nombre"].unique())
 
 # ==========================================
-# 6. INTERFAZ: 5 PESTAÑAS
+# 6. INTERFAZ: 5 PESTAÑAS ÚNICAS
 # ==========================================
 st.title("Gestor Financiero")
 tabs = st.tabs(["🏠 HOME", "💳 GASTOS", "🏦 TARJETAS", "💵 INGRESOS", "🤝 COMPARTIDOS"])
@@ -203,7 +204,7 @@ with tabs[0]:
         st.markdown("---")
         detalle_tarjeta = df_mes.groupby("Tarjeta")["Monto_Num"].sum().to_dict()
         
-        # UI RECONSTRUIDA DE LA PÁGINA 48 DEL PDF
+        # Mantiene la vista agrupada de tarjeta que pediste no modificar
         col_list, col_gap = st.columns([2, 1])
         with col_list:
             for tname, t_total in sorted(detalle_tarjeta.items(), key=lambda x: x[0]):
@@ -218,7 +219,7 @@ with tabs[0]:
                     f"</div>", unsafe_allow_html=True
                 )
                 
-                # Detalle Cuotas
+                # Detalle de Gastos y Cuotas de esta tarjeta
                 gf_detalle = filtrar_gastos_tarjeta_periodo(df_mes, tname, py_sel, pm_sel)
                 if not gf_detalle.empty:
                     for _, r in gf_detalle.sort_values("Monto_Num", ascending=False).iterrows():
@@ -231,7 +232,7 @@ with tabs[0]:
                             f"<span>{fmt_ars(r['Monto_Num'])}</span>"
                             f"</div>", unsafe_allow_html=True
                         )
-                st.write("") # Espacio
+                st.write("") # Espaciador visual
 
 # --- TAB 2: GASTOS ---
 with tabs[1]:
@@ -241,14 +242,14 @@ with tabs[1]:
         f_fecha = col1.date_input("Fecha de Compra", date.today())
         f_concepto = col2.text_input("Concepto")
         
-        st.info("Si es en cuotas, poné el monto TOTAL de la compra. El sistema lo divide solo.")
+        st.info("Si es en cuotas, ingresá el monto TOTAL. El sistema dividirá los pagos por mes automáticamente.")
         f_monto = col1.number_input("Monto TOTAL ($)", min_value=0.0, format="%.2f")
         f_tarjeta = col2.selectbox("Tarjeta / Medio", lista_tarjetas)
         
         f_cuotas = col1.number_input("Cantidad de Cuotas", min_value=1, value=1, step=1)
         f_cat = col2.selectbox("Categoría", CAT_GASTOS)
         
-        f_con_quien = col1.text_input("¿Gasto compartido? ¿Con quién? (Dejar vacío si es 100% tuyo)")
+        f_con_quien = col1.text_input("¿Gasto compartido? (Escribí el nombre. Dejalo vacío si no aplica)")
         f_notas = col2.text_input("Notas adicionales")
         
         if st.form_submit_button("Guardar Gasto"):
@@ -257,39 +258,39 @@ with tabs[1]:
                 st.success("¡Gasto guardado correctamente!")
                 st.rerun()
             else:
-                st.error("Completá el Concepto y el Monto.")
+                st.error("Por favor, completá el Concepto y el Monto.")
                 
     st.markdown("---")
-    st.subheader("Historial Crudo de Gastos")
+    st.subheader("Historial Completo (Edición Rápida)")
     edited_gastos = st.data_editor(load("gastos"), num_rows="dynamic", use_container_width=True)
-    if st.button("Guardar Ediciones Manuales de Gastos"):
+    if st.button("Guardar Cambios en la Tabla de Gastos"):
         save("gastos", edited_gastos)
-        st.success("Base actualizada.")
+        st.success("Base de datos de gastos actualizada.")
         st.rerun()
 
 # --- TAB 3: TARJETAS ---
 with tabs[2]:
     st.header("Gestión de Tarjetas")
     
-    st.subheader("Mis Tarjetas (Configuración)")
+    st.subheader("Configuración")
     edited_tarjetas = st.data_editor(tarjetas_df, num_rows="dynamic", use_container_width=True)
     if st.button("Guardar Configuración de Tarjetas"):
         save("tarjetas", edited_tarjetas)
-        st.success("¡Tarjetas actualizadas!")
+        st.success("¡Configuración actualizada!")
         st.rerun()
         
     st.markdown("---")
-    # BOTÓN PARA BLANQUEAR TARJETA (PUNTO 3 DEL PEDIDO)
+    # PUNTO 3: BOTÓN DE BLANQUEO
     st.subheader("🚨 Opciones Avanzadas")
     with st.expander("Blanquear / Borrar TODOS los gastos de una tarjeta"):
         st.warning("¡Cuidado! Esta acción borra todo el historial de la tarjeta elegida y no se puede deshacer.")
         col_b1, col_b2 = st.columns([2, 1])
-        t_borrar = col_b1.selectbox("Seleccionar Tarjeta a borrar:", lista_tarjetas, key="t_borrar")
+        t_borrar = col_b1.selectbox("Seleccionar Tarjeta a limpiar:", lista_tarjetas, key="t_borrar")
         if col_b2.button(f"🗑️ ELIMINAR GASTOS DE {t_borrar}"):
             g_actual = load("gastos")
             g_nuevo = g_actual[g_actual["Tarjeta"] != t_borrar]
             save("gastos", g_nuevo)
-            st.success(f"Se eliminó el historial de {t_borrar}.")
+            st.success(f"Se eliminó el historial completo de la tarjeta {t_borrar}.")
             st.rerun()
 
 # --- TAB 4: INGRESOS ---
@@ -312,27 +313,27 @@ with tabs[3]:
                     "Categoria": i_cat
                 }])
                 save("ingresos", pd.concat([i_df, nuevo_i], ignore_index=True))
-                st.success("¡Ingreso adentro!")
+                st.success("¡Ingreso registrado!")
                 st.rerun()
             else:
                 st.error("Completá el Concepto y el Monto.")
                 
     st.subheader("Historial de Ingresos")
     edited_ing = st.data_editor(load("ingresos"), num_rows="dynamic", use_container_width=True)
-    if st.button("Guardar Ediciones de Ingresos"):
+    if st.button("Guardar Cambios en la Tabla de Ingresos"):
         save("ingresos", edited_ing)
-        st.success("Ingresos actualizados.")
+        st.success("Base de datos de ingresos actualizada.")
         st.rerun()
 
 # --- TAB 5: COMPARTIDOS ---
 with tabs[4]:
     st.header("🤝 Gastos Compartidos (Cruce Automático)")
-    st.caption("Esto cruza directo con tus tarjetas. Lo que ves acá es exactamente lo que cargaste con la columna 'Con quien' llena.")
+    st.caption("Esta sección toma automáticamente todo gasto donde la columna 'Con quien' tenga un nombre ingresado.")
     
     comp_df = gastos_df[gastos_df["Con quien"].str.strip() != ""]
     
     if comp_df.empty:
-        st.info("No tenés gastos compartidos actualmente.")
+        st.info("Todavía no registraste ningún gasto compartido con otra persona.")
     else:
         modo = st.radio("Filtro de Análisis:", ["Ver por Periodo de Resumen", "Ver por Persona Específica"], horizontal=True)
         
@@ -360,7 +361,6 @@ with tabs[4]:
             
             st.markdown("### ¿Cuánto fue por cada Resumen?")
             agrup_res = df_p.groupby("Periodo_Str")["Monto_Num"].sum().reset_index()
-            # Ordenar por periodo
             agrup_res['sort_val'] = agrup_res['Periodo_Str'].apply(lambda x: f"{x.split('/')[1]}{x.split('/')[0]}")
             agrup_res = agrup_res.sort_values('sort_val', ascending=False)
             
@@ -369,5 +369,6 @@ with tabs[4]:
                 
             st.markdown("### Desglose:")
             st.dataframe(df_p[["Fecha", "Concepto", "Monto", "Tarjeta", "Periodo_Str", "Cuotas"]], use_container_width=True)
+
 
 ```
