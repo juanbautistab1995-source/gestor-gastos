@@ -1562,6 +1562,105 @@ with tabs[4]:
     pends = comp_df[comp_df["Estado"] == "Pendiente"].sort_values("Fecha", ascending=False)
     cobs  = comp_df[comp_df["Estado"] != "Pendiente"].sort_values("Fecha", ascending=False)
 
+    # ── Resumen agrupado por persona ────────────────────────────────────────
+    # Permite ver de un vistazo cuánto te debe CADA persona (ej: "Sol"), en vez
+    # de tener que escanear toda la lista plana buscando su nombre a mano.
+    # Se agrupa por la columna "Con quien" — la misma que ya alimentan tanto
+    # el alta directa en este tab como un gasto marcado Compartido=Sí.
+    # IMPORTANTE: se trabaja sobre una COPIA (comp_df_agrupado), nunca sobre
+    # comp_df directamente — más abajo el botón "✓ Cobrado" hace
+    # save("compartidos", comp_df), y si comp_df tuviera la columna auxiliar
+    # "_quien_norm" pegada, esa columna basura quedaría persistida en el CSV.
+    comp_df_agrupado = comp_df.copy()
+    if not comp_df_agrupado.empty:
+        comp_df_agrupado["_quien_norm"] = comp_df_agrupado["Con quien"].fillna("").astype(str).str.strip()
+        comp_df_con_persona = comp_df_agrupado[comp_df_agrupado["_quien_norm"] != ""]
+    else:
+        comp_df_con_persona = comp_df_agrupado
+
+    if not comp_df_con_persona.empty:
+        st.markdown("<div class='sec'>Por persona</div>", unsafe_allow_html=True)
+        # Cálculo manual con groupby().agg() simple (compatible con cualquier
+        # versión de pandas — se evita apply()+include_groups que solo existe
+        # en versiones recientes y podría no estar disponible en el deploy).
+        mask_pend = comp_df_con_persona["Estado"] == "Pendiente"
+        pend_por_persona = comp_df_con_persona[mask_pend].groupby("_quien_norm")["Monto"].sum()
+        cant_por_persona = comp_df_con_persona[mask_pend].groupby("_quien_norm")["Monto"].count()
+        cobr_por_persona = comp_df_con_persona[~mask_pend].groupby("_quien_norm")["Monto"].sum()
+
+        nombres_unicos = sorted(comp_df_con_persona["_quien_norm"].unique())
+        resumen_personas = pd.DataFrame({
+            "persona":   nombres_unicos,
+            "pendiente": [pend_por_persona.get(n, 0) for n in nombres_unicos],
+            "cant_pend": [int(cant_por_persona.get(n, 0)) for n in nombres_unicos],
+            "cobrado":   [cobr_por_persona.get(n, 0) for n in nombres_unicos],
+        })
+        # Ordenar: primero quienes tienen pendiente (de mayor a menor), después el resto
+        resumen_personas = resumen_personas.sort_values(
+            by=["pendiente", "cobrado"], ascending=[False, False]
+        ).reset_index(drop=True)
+
+        nombres_personas = resumen_personas["persona"].tolist()
+        for _, rp in resumen_personas.iterrows():
+            tiene_pend = rp["pendiente"] > 0
+            color_val = "c-yel" if tiene_pend else "c-dim"
+            sub = f"{rp['cant_pend']} pendiente(s)" if tiene_pend else "todo saldado"
+            st.markdown(
+                "<div class='tarjeta-row'>"
+                f"<div class='tarjeta-pip' style='background:{'#f5c542' if tiene_pend else '#333'}'></div>"
+                f"<div style='flex:1'><div class='tarjeta-label'>{rp['persona']}</div>"
+                f"<div class='tarjeta-meta-small'>{sub}</div></div>"
+                f"<div class='tarjeta-amount {color_val}'>{fmt_ars(rp['pendiente']) if tiene_pend else fmt_ars(rp['cobrado'])}</div>"
+                "</div>", unsafe_allow_html=True
+            )
+
+        # Selector para ver el detalle de una persona puntual
+        persona_sel = st.selectbox(
+            "Ver detalle de", ["— elegí una persona —"] + nombres_personas, key="persona_detalle_sel"
+        )
+        if persona_sel != "— elegí una persona —":
+            detalle_persona = comp_df_con_persona[comp_df_con_persona["_quien_norm"] == persona_sel]
+            det_pend = detalle_persona[detalle_persona["Estado"] == "Pendiente"].sort_values("Fecha", ascending=False)
+            det_cob  = detalle_persona[detalle_persona["Estado"] != "Pendiente"].sort_values("Fecha", ascending=False)
+
+            st.markdown(f"<div class='sec'>Pendiente con {persona_sel}</div>", unsafe_allow_html=True)
+            if det_pend.empty:
+                st.markdown("<div class='empty'><big>🎉</big>Nada pendiente con esta persona.</div>", unsafe_allow_html=True)
+            else:
+                for _, r in det_pend.iterrows():
+                    st.markdown(
+                        "<div class='pend-row'>"
+                        "<div class='tx-ico'>🤝</div>"
+                        "<div class='tx-main'>"
+                        f"<div class='tx-name'>{r.get('Concepto','—')}</div>"
+                        f"<div class='tx-info'>{str(r.get('Fecha',''))[:10]}{(' · ' + str(r['Notas'])) if str(r.get('Notas','')).strip() else ''}</div>"
+                        "</div>"
+                        f"<div class='tx-amt c-yel'>{fmt_ars(r.get('Monto',0))}</div>"
+                        "</div>", unsafe_allow_html=True)
+                st.markdown(
+                    "<div class='total-strip'>"
+                    f"<span class='total-strip-label'>Total pendiente · {persona_sel}</span>"
+                    f"<span class='total-strip-val c-yel'>{fmt_ars(det_pend['Monto'].sum())}</span>"
+                    "</div>", unsafe_allow_html=True)
+
+            if not det_cob.empty:
+                with st.expander(f"Ya saldado con {persona_sel} ({len(det_cob)})"):
+                    for _, r in det_cob.iterrows():
+                        st.markdown(
+                            "<div class='tx'>"
+                            "<div class='tx-ico'>✅</div>"
+                            "<div class='tx-main'>"
+                            f"<div class='tx-name'>{r.get('Concepto','—')}</div>"
+                            f"<div class='tx-info'>{str(r.get('Fecha',''))[:10]}</div>"
+                            "</div>"
+                            f"<div class='tx-amt c-dim'>{fmt_ars(r.get('Monto',0))}</div>"
+                            "</div>", unsafe_allow_html=True)
+                    st.markdown(
+                        "<div class='total-strip'>"
+                        f"<span class='total-strip-label'>Total saldado · {persona_sel}</span>"
+                        f"<span class='total-strip-val c-dim'>{fmt_ars(det_cob['Monto'].sum())}</span>"
+                        "</div>", unsafe_allow_html=True)
+
     st.markdown("<div class='sec'>Pendientes de cobrar</div>", unsafe_allow_html=True)
     if pends.empty:
         st.markdown("<div class='empty'><big>🎉</big>Todo cobrado.</div>", unsafe_allow_html=True)
