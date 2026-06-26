@@ -43,7 +43,16 @@ import requests
 
 # ── Archivos ───────────────────────────────────────────────────────────────────
 FILES = {
-    "gastos":   ("mis_gastos.csv",   ["Fecha","Concepto","Monto","Tarjeta","Cuotas","Categoria","Compartido","Con quien","Cuanto recupero","Notas"]),
+    # "Periodo": fecha que indica a qué CICLO de tarjeta pertenece esta fila,
+    # independiente de "Fecha" (que es la fecha real de compra). Para un
+    # gasto sin cuotas, Periodo == Fecha. Para una cuota de una compra vieja
+    # que el banco vuelve a facturar este mes (con la fecha de compra ORIGINAL
+    # intacta, como hacen los resúmenes argentinos: "Cuota 6/12" sigue
+    # mostrando la fecha de la compra, no de hoy), Periodo se actualiza a la
+    # fecha de cierre del ciclo actual cada vez que se reimporta el resumen.
+    # El filtro de "qué pertenece a este período" usa SIEMPRE Periodo, nunca
+    # Fecha — así nunca se inventan ni proyectan fechas de cuotas futuras.
+    "gastos":   ("mis_gastos.csv",   ["Fecha","Concepto","Monto","Tarjeta","Cuotas","Categoria","Compartido","Con quien","Cuanto recupero","Notas","Periodo"]),
     "ingresos": ("mis_ingresos.csv", ["Fecha","Concepto","Monto","Categoria"]),
     # "Proximo cierre" (fecha exacta YYYY-MM-DD) y "Dias entre cierres" (intervalo)
     # permiten reflejar tarjetas cuyo ciclo NO cae el mismo día fijo cada mes
@@ -61,7 +70,6 @@ CAT_GASTOS = ["🍔 Comida","🚗 Transporte","🎉 Salidas","✈️ Viaje","�
 CAT_ING    = ["💼 Sueldo","💻 Freelance","📈 Inversión","🎁 Regalo","💰 Otro"]
 COLORES_TARJETA = ["#7c6af7","#4ade80","#f87171","#fbbf24","#60a5fa","#f472b6","#34d399","#fb923c"]
 TARJETAS_DEFAULT = ["Visa ICBC","Visa Hipotecario","Master ICBC","Efectivo","Débito","Otro"]
-_MIGRACION_FLAG = ".cuotas_migradas_v1"
 
 # ── Helpers de fecha ────────────────────────────────────────────────────────────
 _MESES_ES = {
@@ -295,99 +303,110 @@ def fmt_cuotas(actual, total):
         return "1"
     return f"Cuota {actual}/{total}"
 
-def _sumar_meses(fecha_base, n_meses):
-    """Suma n_meses meses calendario a fecha_base, ajustando el día si el mes
-    destino tiene menos días (ej: 31 ene + 1 mes -> 28/29 feb, no 31 feb)."""
-    mes_total = fecha_base.month - 1 + n_meses
-    año = fecha_base.year + mes_total // 12
-    mes = mes_total % 12 + 1
-    dia = min(fecha_base.day, calendar.monthrange(año, mes)[1])
-    return date(año, mes, dia)
+# ── Cuotas: modelo "tal cual el resumen" (rediseño jun-2026) ───────────────────
+# DESCUBRIMIENTO CLAVE: en los resúmenes de Visa ICBC (y la mayoría de bancos
+# argentinos), cada cuota de una compra vieja se sigue facturando MES A MES
+# con la FECHA DE COMPRA ORIGINAL intacta — el banco nunca le pone una fecha
+# nueva. Solo cambia el texto "Cuota X/Y" (ej: marzo decía "3/12", en junio
+# el mismo resumen dice "6/12" para la MISMA fila, misma fecha de marzo).
+#
+# El modelo viejo de esta app GENERABA filas con fechas futuras inventadas
+# (sumando meses desde la fecha de compra) para "proyectar" dónde caería cada
+# cuota — esto producía fechas que NUNCA aparecen en un resumen real, y
+# corrompía los totales por período. Se elimina por completo ese enfoque.
+#
+# MODELO NUEVO: cada fila guarda su Fecha de compra real, intacta, para
+# siempre. Una columna separada "Periodo" indica a qué ciclo de tarjeta
+# pertenece esa fila AHORA — independiente de Fecha. Al reimportar el
+# resumen de un mes, si una fila ya existe (mismo Concepto+Fecha+Tarjeta),
+# se actualiza su Cuotas y su Periodo (avanza al período actual); si no
+# existe, se crea nueva con Periodo = Fecha de hoy (cuota 1, alta real).
+def calcular_periodo_de_importacion(tarjeta_nombre, tarjetas_df):
+    """Devuelve la fecha de FIN del ciclo actual de la tarjeta — el valor
+    que se usa como Periodo para todas las filas de una importación, ya
+    que todas las filas de un mismo resumen pertenecen al mismo ciclo."""
+    _, fin = ciclo_actual_de_tarjeta(tarjeta_nombre, tarjetas_df)
+    return fin.strftime("%Y-%m-%d")
 
-def generar_filas_cuotas(fecha_compra, concepto, monto_x_cuota, tarjeta, n_cuotas,
-                          categoria, compartido, con_quien, cuanto_recupero, notas):
-    """Genera n_cuotas filas REALES nuevas (alta nueva: cuota_actual siempre
-    arranca en 1). monto_x_cuota es el valor de UNA cuota — lo que realmente
-    se paga cada mes, mismo criterio que usa el resto de la app. Cada fila es
-    independiente desde el momento en que se crea: no hay vínculo posterior
-    entre ellas, así que editar o borrar una no afecta a las demás (a pedido
-    explícito del usuario, por si el banco cobra distinto algún mes puntual)."""
-    filas = []
-    for n_cuota in range(1, n_cuotas + 1):
-        fecha_cuota = _sumar_meses(fecha_compra, n_cuota - 1)
-        filas.append({
-            "Fecha": fecha_cuota.strftime("%Y-%m-%d"),
-            "Concepto": concepto,
-            "Monto": monto_x_cuota,
-            "Tarjeta": tarjeta,
-            "Cuotas": fmt_cuotas(n_cuota, n_cuotas),
-            "Categoria": categoria,
-            "Compartido": compartido,
-            "Con quien": con_quien,
-            "Cuanto recupero": cuanto_recupero,
-            "Notas": notas,
-        })
-    return pd.DataFrame(filas, columns=FILES["gastos"][1])
+def actualizar_o_crear_gastos(base_df, nuevos_df, periodo_str):
+    """Para cada fila de nuevos_df (un resumen recién importado o pegado):
+    - Si YA EXISTE una fila en base_df con el mismo (Concepto normalizado +
+      Fecha + Tarjeta normalizada): se actualiza SOLO su Cuotas y su Periodo
+      (la cuota avanzó de mes, ej "3/12" -> "6/12"). La Fecha original NUNCA
+      se toca — sigue siendo la fecha real de la compra.
+    - Si NO existe: es una compra nueva (cuota 1 o gasto sin cuotas) — se
+      agrega con Periodo = periodo_str.
+    Devuelve (base_actualizada, cant_actualizadas, cant_nuevas)."""
+    base = base_df.copy()
+    if "Periodo" not in base.columns:
+        base["Periodo"] = base["Fecha"]
+    base["_clave"] = (
+        base["Concepto"].apply(_normalizar_texto) + "|" +
+        base["Fecha"].astype(str) + "|" +
+        base["Tarjeta"].apply(_normalizar_texto)
+    )
+    nuevas_filas = []
+    cant_actualizadas = 0
+    for _, r in nuevos_df.iterrows():
+        clave = (
+            _normalizar_texto(r["Concepto"]) + "|" +
+            str(r["Fecha"]) + "|" +
+            _normalizar_texto(r["Tarjeta"])
+        )
+        match = base[base["_clave"] == clave]
+        if not match.empty:
+            idx = match.index[0]
+            base.loc[idx, "Cuotas"] = r.get("Cuotas", "1")
+            base.loc[idx, "Periodo"] = periodo_str
+            cant_actualizadas += 1
+        else:
+            nueva = r.to_dict()
+            nueva["Periodo"] = periodo_str
+            nuevas_filas.append(nueva)
+    base = base.drop(columns=["_clave"])
+    if nuevas_filas:
+        nuevas_df_final = pd.DataFrame(nuevas_filas)
+        for col in FILES["gastos"][1]:
+            if col not in nuevas_df_final.columns:
+                nuevas_df_final[col] = ""
+        base = pd.concat([base, nuevas_df_final], ignore_index=True)
+    return base, cant_actualizadas, len(nuevas_filas)
 
-def _generar_filas_cuotas_desde_ancla(fecha_ancla, cuota_actual, n_cuotas, fila_base):
-    """Para MIGRACIÓN de datos viejos: fecha_ancla es la fecha que ya estaba
-    guardada (corresponde a cuota_actual, no necesariamente la 1/N). Genera
-    las n_cuotas filas completas proyectando desde ese ancla hacia atrás y
-    hacia adelante, conservando el resto de los campos de fila_base."""
-    filas = []
-    for n_cuota in range(1, n_cuotas + 1):
-        delta = n_cuota - cuota_actual
-        fecha_cuota = _sumar_meses(fecha_ancla, delta)
-        nueva = dict(fila_base)
-        nueva["Fecha"] = fecha_cuota.strftime("%Y-%m-%d")
-        nueva["Cuotas"] = fmt_cuotas(n_cuota, n_cuotas)
-        filas.append(nueva)
-    return filas
-
-def migrar_cuotas_viejas_a_filas_reales(gastos_df):
-    """Recorre todo el CSV de gastos una sola vez: cualquier fila cuyo campo
-    Cuotas indique más de 1 cuota total ('Cuota X/Y' guardado por la versión
-    vieja) se REEMPLAZA por sus N filas reales correspondientes. Filas sin
-    cuotas quedan intactas."""
-    filas_finales = []
-    hubo_cambios = False
-    for _, r in gastos_df.iterrows():
-        actual, total = parsear_cuotas(r.get("Cuotas", 1))
-        fecha_raw = str(r.get("Fecha", "")).strip()
-        try:
-            fecha_ancla = datetime.strptime(fecha_raw[:10], "%Y-%m-%d").date()
-        except (ValueError, TypeError):
-            fecha_ancla = None
-
-        if total <= 1 or fecha_ancla is None:
-            filas_finales.append(r.to_dict())
-            continue
-
-        hubo_cambios = True
-        nuevas = _generar_filas_cuotas_desde_ancla(fecha_ancla, actual, total, r.to_dict())
-        filas_finales.extend(nuevas)
-
-    resultado = pd.DataFrame(filas_finales, columns=FILES["gastos"][1]) if filas_finales else gastos_df.copy()
-    return resultado, hubo_cambios
-
-def ejecutar_migracion_cuotas_si_corresponde():
-    """Corre la migración UNA SOLA VEZ en la vida del CSV (marcada con un
-    archivo flag en disco, para que sobreviva entre reinicios del proceso).
-    Si ya se migró, no hace nada — evita duplicar filas en cada render."""
-    if os.path.exists(_MIGRACION_FLAG):
-        return False
-    gastos_df = load("gastos")
+def eliminar_cuotas_modelo_viejo(gastos_df):
+    """Borra todas las filas que pertenecen al modelo viejo de cuotas
+    proyectadas (cuota total > 1 Y no tienen columna Periodo poblada, o su
+    Periodo es igual a su Fecha pero el total de cuotas es mayor a 1 con
+    fecha que no es la cuota 1 — señal de que fue generada/inventada).
+    Se usa una sola vez, a pedido explícito del usuario, para limpiar datos
+    cargados con la versión anterior de la app antes de adoptar el modelo
+    de Periodo. Devuelve (gastos_limpios, cantidad_eliminada)."""
     if gastos_df.empty:
-        open(_MIGRACION_FLAG, "w").close()
-        return False
-    migrado, hubo_cambios = migrar_cuotas_viejas_a_filas_reales(gastos_df)
-    if hubo_cambios:
-        migrado["Monto"] = to_num(migrado["Monto"])
-        migrado["Cuanto recupero"] = to_num(migrado["Cuanto recupero"])
-        migrado = sort_by_fecha(migrado)
-        save("gastos", migrado)
-    open(_MIGRACION_FLAG, "w").close()
-    return hubo_cambios
+        return gastos_df, 0
+    actual_total = gastos_df["Cuotas"].apply(parsear_cuotas)
+    mask_con_cuotas = actual_total.apply(lambda t: t[1] > 1)
+    eliminadas = int(mask_con_cuotas.sum())
+    limpio = gastos_df[~mask_con_cuotas].copy().reset_index(drop=True)
+    return limpio, eliminadas
+
+_MIGRACION_FLAG_V2 = ".periodo_v2_activado"
+
+def asegurar_columna_periodo():
+    """Si el CSV de gastos no tiene la columna Periodo (datos de antes de
+    este rediseño), la agrega igualando Periodo = Fecha para gastos sin
+    cuotas. No se ejecuta más de una vez (flag en disco)."""
+    if os.path.exists(_MIGRACION_FLAG_V2):
+        return
+    gastos_df = load("gastos")
+    if not gastos_df.empty and "Periodo" in gastos_df.columns:
+        falta_periodo = gastos_df["Periodo"].astype(str).str.strip() == ""
+        if falta_periodo.any():
+            gastos_df.loc[falta_periodo, "Periodo"] = gastos_df.loc[falta_periodo, "Fecha"]
+            gastos_df["Monto"] = to_num(gastos_df["Monto"])
+            gastos_df["Cuanto recupero"] = to_num(gastos_df["Cuanto recupero"])
+            save("gastos", gastos_df)
+    open(_MIGRACION_FLAG_V2, "w").close()
+
+
 
 # ── Tarjetas y ciclos reales (FIX problema 2 — ver resumen del refactor) ───────
 def get_tarjetas_nombres(gastos_df, tarjetas_df):
@@ -407,6 +426,22 @@ def get_tarjetas_nombres(gastos_df, tarjetas_df):
             if t and t not in ("nan", "None", "") and t not in nombres:
                 nombres.append(t)
     return nombres
+
+def get_tarjeta_principal(gastos_df, tarjetas_df):
+    """Devuelve el nombre de la tarjeta con más gastos cargados (la más
+    usada). Se usa para que el HERO de Home decida su período según el
+    ciclo de cierre REAL de esa tarjeta, en vez de un mes calendario
+    genérico — así nunca se desalinea con lo que muestra Tarjetas para esa
+    misma tarjeta (a pedido explícito, porque distintas tarjetas pueden
+    cerrar en días distintos del mes)."""
+    if gastos_df.empty or "Tarjeta" not in gastos_df.columns:
+        nombres = get_tarjetas_nombres(gastos_df, tarjetas_df)
+        return nombres[0] if nombres else "Visa ICBC"
+    conteo = gastos_df["Tarjeta"].value_counts()
+    if conteo.empty:
+        nombres = get_tarjetas_nombres(gastos_df, tarjetas_df)
+        return nombres[0] if nombres else "Visa ICBC"
+    return conteo.idxmax()
 
 def _generar_fechas_cierre(tarjeta_row, rango_dias=400):
     """Genera la lista de fechas de cierre (date objects) para una tarjeta,
@@ -533,16 +568,17 @@ def ciclo_actual_de_tarjeta(tarjeta_nombre, tarjetas_df):
     return max(ciclos) if ciclos else (date(hoy.year, hoy.month, 1), date(hoy.year, hoy.month, calendar.monthrange(hoy.year, hoy.month)[1]))
 
 def filtrar_gastos_tarjeta_rango(gastos_df, tarjeta_nombre, inicio, fin):
-    """Filtra gastos de una tarjeta cuya Fecha cae dentro de [inicio, fin].
-    PERFORMANCE FIX: reemplaza el viejo filtrar_gastos_tarjeta_periodo, que
-    iteraba fila por fila con iterrows() llamando periodo_actual_de_gasto()
-    (con su propio loop de fechas de cierre) por cada gasto. Acá se filtra de
-    forma vectorizada directo sobre el rango real de fechas — más rápido y
-    sin la ambigüedad de 'a qué mes pertenece' que causaba el problema 2."""
+    """Filtra gastos de una tarjeta cuyo PERIODO (no Fecha) cae dentro de
+    [inicio, fin]. Usa Periodo, no Fecha, porque Fecha es la fecha real de
+    compra (que para una cuota vieja puede ser de meses atrás) mientras que
+    Periodo es el ciclo de tarjeta al que esa fila pertenece ahora — ver
+    el bloque de comentarios sobre el modelo de cuotas más arriba en el
+    archivo para el porqué de esta distinción."""
     if gastos_df.empty:
         return gastos_df.copy()
     mask_tarjeta = gastos_df["Tarjeta"].astype(str).str.strip() == tarjeta_nombre.strip()
-    fechas = pd.to_datetime(gastos_df["Fecha"], errors="coerce").dt.date
+    columna_periodo = gastos_df["Periodo"] if "Periodo" in gastos_df.columns else gastos_df["Fecha"]
+    fechas = pd.to_datetime(columna_periodo, errors="coerce").dt.date
     mask_rango = fechas.notna() & (fechas >= inicio) & (fechas <= fin)
     return gastos_df[mask_tarjeta & mask_rango].copy()
 
@@ -566,7 +602,7 @@ def obtener_cotizacion_dolar_tarjeta():
     """Consulta la cotización del 'dólar tarjeta' (oficial + impuestos PAIS/
     ganancias). Cacheada 1 hora. Devuelve el valor de VENTA."""
     try:
-        resp = requests.get("[https://dolarapi.com/v1/dolares/tarjeta](https://dolarapi.com/v1/dolares/tarjeta)", timeout=5)
+        resp = requests.get("https://dolarapi.com/v1/dolares/tarjeta", timeout=5)
         resp.raise_for_status()
         data = resp.json()
         venta = float(data.get("venta", 0))
@@ -706,7 +742,7 @@ st.set_page_config(page_title="Biyuyo", layout="centered", initial_sidebar_state
 
 st.markdown("""
 <style>
-@import url('[https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap](https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap)');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
 *,*::before,*::after{box-sizing:border-box}
 html,body,[class*="css"],.stApp{font-family:'DM Sans',sans-serif!important;background-color:#080810!important;color:#dde0f0!important;-webkit-font-smoothing:antialiased}
 #MainMenu,header,footer{visibility:hidden}
@@ -782,8 +818,8 @@ label[data-testid="stWidgetLabel"] p{font-size:0.68rem!important;font-weight:600
 if "gasto_limit" not in st.session_state: st.session_state.gasto_limit = 30
 if "menu_accion" not in st.session_state: st.session_state.menu_accion = False
 
-# ── Migración automática de cuotas viejas (una sola vez en la vida del CSV) ────
-ejecutar_migracion_cuotas_si_corresponde()
+# ── Asegurar columna Periodo en datos viejos (una sola vez) ────────────────────
+asegurar_columna_periodo()
 
 # ── Cargar datos UNA SOLA VEZ por render (PERFORMANCE FIX) ─────────────────────
 # Antes, varias pestañas volvían a llamar load("gastos")/load("tarjetas") por
@@ -800,10 +836,25 @@ ingresos_df["Monto"]         = to_num(ingresos_df["Monto"])
 
 gastos_df = sort_by_fecha(gastos_df)
 
-y, m = mes_actual()
+# El HERO de Home usa el ciclo real de cierre de la TARJETA PRINCIPAL (la
+# más usada), no un mes calendario genérico — a pedido explícito, porque
+# distintas tarjetas pueden cerrar en días distintos del mes, y usar el mes
+# calendario podía desalinear el hero respecto a lo que muestra Tarjetas
+# para esa misma tarjeta (ej: tarjeta que cierra el 25, hoy es 26 -> el
+# ciclo real ya es el del mes siguiente, pero el mes calendario seguía
+# diciendo el actual).
+_tarjeta_principal_home = get_tarjeta_principal(gastos_df, tarjetas_df)
+_ini_home, _fin_home = ciclo_actual_de_tarjeta(_tarjeta_principal_home, tarjetas_df)
+y, m = _fin_home.year, _fin_home.month
 nombre_mes = calendar.month_name[m].capitalize()
 
-gastos_mes   = gastos_df[pd.to_datetime(gastos_df["Fecha"], errors="coerce").dt.to_period("M") == pd.Period(year=y, month=m, freq="M")] if not gastos_df.empty else gastos_df
+# IMPORTANTE: gastos_mes filtra por "Periodo" (ciclo de tarjeta), NO por
+# "Fecha" (fecha real de compra) — mismo motivo que en Tarjetas y
+# Compartidos. Si se filtrara por Fecha, una cuota vieja vigente este
+# período (con Fecha de hace meses) quedaría afuera del total de Home pero
+# SÍ aparecería en Tarjetas, recreando la discrepancia Home≠Tarjetas.
+columna_periodo_home = gastos_df["Periodo"] if "Periodo" in gastos_df.columns else gastos_df["Fecha"]
+gastos_mes   = gastos_df[pd.to_datetime(columna_periodo_home, errors="coerce").dt.to_period("M") == pd.Period(year=y, month=m, freq="M")] if not gastos_df.empty else gastos_df
 ingresos_mes = ingresos_df[pd.to_datetime(ingresos_df["Fecha"], errors="coerce").dt.to_period("M") == pd.Period(year=y, month=m, freq="M")] if not ingresos_df.empty else ingresos_df
 
 total_ing  = ingresos_mes["Monto"].sum()
@@ -843,17 +894,26 @@ if st.session_state.menu_accion:
             c3,c4 = st.columns(2)
             q_t = c3.selectbox("Tarjeta", TARJETAS)
             q_k = c4.selectbox("Categoría", CAT_GASTOS)
-            c5,c6 = st.columns(2)
-            q_f = c5.date_input("Fecha", value=date.today())
-            q_cu = c6.number_input("Cuotas", min_value=1, max_value=48, value=1)
+            c5,c6,c7 = st.columns(3)
+            q_f = c5.date_input("Fecha de compra", value=date.today())
+            q_cu_act = c6.number_input("Cuota actual", min_value=1, max_value=48, value=1)
+            q_cu_tot = c7.number_input("Cuota total", min_value=1, max_value=48, value=1)
             ca,cb = st.columns([3,1])
             if ca.form_submit_button("Guardar gasto"):
                 if q_c.strip() and q_m > 0:
-                    # FIX PROBLEMA 4: en vez de guardar 1 fila con "Cuotas"=N y
-                    # dejar que el resto se proyecte en memoria, se generan y
-                    # guardan las N filas reales directamente.
-                    nv = generar_filas_cuotas(q_f, q_c.strip(), q_m, q_t, int(q_cu),
-                                               q_k, "No", "", 0, "")
+                    # MODELO NUEVO: una sola fila, con la Fecha de compra
+                    # real (NO se inventan fechas futuras de otras cuotas —
+                    # cuando el banco facture la cuota siguiente, se
+                    # actualiza esta misma fila al reimportar ese resumen).
+                    # Periodo = hoy, porque esta carga corresponde al ciclo
+                    # actual de la tarjeta.
+                    periodo_hoy = calcular_periodo_de_importacion(q_t, tarjetas_df)
+                    nv = pd.DataFrame([{
+                        "Fecha": fmt_fecha(q_f), "Concepto": q_c.strip(), "Monto": q_m,
+                        "Tarjeta": q_t, "Cuotas": fmt_cuotas(int(q_cu_act), int(q_cu_tot)),
+                        "Categoria": q_k, "Compartido": "No", "Con quien": "",
+                        "Cuanto recupero": 0, "Notas": "", "Periodo": periodo_hoy,
+                    }])
                     gastos_df = pd.concat([gastos_df, nv], ignore_index=True)
                     gastos_df = sort_by_fecha(gastos_df)
                     save("gastos", gastos_df)
@@ -1035,17 +1095,15 @@ with tabs[1]:
         st.markdown(
             "<div class='info-strip'>Pasale tus capturas de resumen a Claude (chat normal) y pedile que te devuelva "
             "el CSV con columnas <code>Fecha,Concepto,Monto,Cuotas</code>. Pegalo acá. "
-            "Si el CSV no trae columna Tarjeta, elegí una abajo — se aplica a todas las filas. "
-            "Las filas en cuotas se expanden automáticamente a una fila real por cada cuota.</div>",
+            "Si el CSV no trae columna Tarjeta, elegí una abajo — se aplica a todas las filas.<br><br>"
+            "<b>Importante:</b> la Fecha de cada fila tiene que ser la fecha REAL de la compra (la que "
+            "trae tu resumen), no se inventa ninguna fecha. Si una compra en cuotas ya estaba cargada de "
+            "un mes anterior, se detecta por Concepto+Fecha+Tarjeta y se actualiza su número de cuota — "
+            "no se duplica ni se crea una fila nueva.</div>",
             unsafe_allow_html=True
         )
         csv_text = st.text_area("", placeholder="Fecha,Concepto,Monto,Cuotas\n2026-05-24,MERPAGO*SOFIACARLINI,16476.46,1\n...", height=140, label_visibility="collapsed", key="csv_import_text")
-        
-        c_usd1, c_usd2 = st.columns(2)
-        with c_usd1:
-            tarjeta_import = st.selectbox("Tarjeta (si el CSV no la trae)", TARJETAS, key="tarjeta_import_sel")
-        with c_usd2:
-            cotiz_manual = st.number_input("Cotización USD (0 = automática)", min_value=0.0, step=10.0, value=0.0, help="Si dejás 0, consulta la API oficial en vivo. Si tu resumen tiene una cotización exacta, mandala acá para que no te genere un 'posible duplicado' en el futuro por diferencias de centavos.")
+        tarjeta_import = st.selectbox("Tarjeta para estos movimientos (si el CSV no la trae)", TARJETAS, key="tarjeta_import_sel")
 
         if st.button("🔍 Previsualizar", key="preview_csv"):
             if csv_text.strip():
@@ -1066,6 +1124,9 @@ with tabs[1]:
                         if col not in nuevos.columns:
                             nuevos[col] = "0" if col in ["Monto","Cuanto recupero"] else ("No" if col=="Compartido" else "")
                     nuevos = nuevos[FILES["gastos"][1]]
+                    # FECHA: se conserva tal cual viene del resumen (fecha real
+                    # de compra). NUNCA se inventan fechas de otras cuotas —
+                    # ver el bloque de comentarios sobre el modelo de cuotas.
                     nuevos["Fecha"] = nuevos["Fecha"].apply(normalizar_fecha_existente)
                     nuevos["Monto"] = to_num(nuevos["Monto"])
 
@@ -1074,11 +1135,7 @@ with tabs[1]:
                     usd_count = int(usd_mask.sum())
                     usd_sin_convertir = 0
                     if usd_count > 0:
-                        if cotiz_manual > 0:
-                            cotiz = float(cotiz_manual)
-                        else:
-                            cotiz = obtener_cotizacion_dolar_tarjeta()
-                            
+                        cotiz = obtener_cotizacion_dolar_tarjeta()
                         if cotiz:
                             nuevos.loc[usd_mask, "Notas"] = nuevos.loc[usd_mask, "Notas"].astype(str) + f" [USD→ARS @ ${cotiz:,.2f}]"
                             nuevos.loc[usd_mask, "Monto"] = nuevos.loc[usd_mask, "Monto"].apply(
@@ -1094,51 +1151,62 @@ with tabs[1]:
                     excluidos_count = int(es_pago_mask.sum())
                     nuevos = nuevos[~es_pago_mask].copy()
 
-                    # FIX CUOTAS: expandir cuotas a filas reales ANTES de
-                    # chequear duplicados. La fecha del CSV del banco es la FECHA DE COMPRA (Cuota 1).
-                    filas_expandidas = []
-                    for _, r in nuevos.iterrows():
-                        actual, total = parsear_cuotas(r.get("Cuotas", 1))
-                        try:
-                            fecha_compra = datetime.strptime(str(r["Fecha"])[:10], "%Y-%m-%d").date()
-                        except (ValueError, TypeError):
-                            fecha_compra = None
-                            
-                        if total <= 1 or fecha_compra is None:
-                            filas_expandidas.append(r.to_dict())
-                        else:
-                            # Proyectar siempre desde la fecha de compra original hacia adelante
-                            for n_cuota in range(1, total + 1):
-                                fecha_cuota = _sumar_meses(fecha_compra, n_cuota - 1)
-                                nueva = dict(r.to_dict())
-                                nueva["Fecha"] = fecha_cuota.strftime("%Y-%m-%d")
-                                nueva["Cuotas"] = fmt_cuotas(n_cuota, total)
-                                filas_expandidas.append(nueva)
-                                
-                    nuevos = pd.DataFrame(filas_expandidas, columns=FILES["gastos"][1]) if filas_expandidas else nuevos
-                    nuevos["Monto"] = to_num(nuevos["Monto"])
-
-                    # Filtrar duplicados (vectorizado) contra lo ya guardado
+                    # MODELO NUEVO: clasificar cada fila en NUEVA, ACTUALIZACIÓN
+                    # (la cuota avanzó de número, misma Concepto+Fecha+Tarjeta
+                    # que ya existe) o DUPLICADO EXACTO (Concepto+Fecha+Tarjeta+
+                    # Cuotas+Monto idénticos a lo ya guardado — no aporta nada
+                    # nuevo, probablemente se pegó el mismo resumen dos veces).
                     gastos_actuales = load("gastos")
                     gastos_actuales["Monto"] = to_num(gastos_actuales["Monto"])
+                    if "Periodo" not in gastos_actuales.columns:
+                        gastos_actuales["Periodo"] = gastos_actuales["Fecha"]
 
-                    es_dup_mask = es_duplicado_vectorizado(nuevos, gastos_actuales)
-                    nuevos_filtrados = nuevos[~es_dup_mask].copy()
-                    duplicados_count = int(es_dup_mask.sum())
+                    clave_existente = (
+                        gastos_actuales["Concepto"].apply(_normalizar_texto) + "|" +
+                        gastos_actuales["Fecha"].astype(str) + "|" +
+                        gastos_actuales["Tarjeta"].apply(_normalizar_texto)
+                    )
+                    mapa_existente = {}
+                    for idx_e, clave_e in clave_existente.items():
+                        mapa_existente.setdefault(clave_e, []).append(idx_e)
 
-                    st.session_state["_csv_preview"] = nuevos_filtrados
+                    filas_nuevas, filas_actualizacion, filas_dup_exacto = [], [], []
+                    for _, r in nuevos.iterrows():
+                        clave_n = _normalizar_texto(r["Concepto"]) + "|" + str(r["Fecha"]) + "|" + _normalizar_texto(r["Tarjeta"])
+                        idxs = mapa_existente.get(clave_n, [])
+                        if not idxs:
+                            filas_nuevas.append(r)
+                            continue
+                        fila_existente = gastos_actuales.loc[idxs[0]]
+                        mismo_monto = abs(float(fila_existente["Monto"]) - float(r["Monto"])) < 1.0
+                        misma_cuota = str(fila_existente["Cuotas"]).strip() == str(r["Cuotas"]).strip()
+                        if mismo_monto and misma_cuota:
+                            filas_dup_exacto.append(r)
+                        else:
+                            r_con_idx = r.copy()
+                            r_con_idx["_idx_existente"] = idxs[0]
+                            filas_actualizacion.append(r_con_idx)
+
+                    df_nuevas = pd.DataFrame(filas_nuevas, columns=FILES["gastos"][1]) if filas_nuevas else pd.DataFrame(columns=FILES["gastos"][1])
+                    df_actualizacion = pd.DataFrame(filas_actualizacion) if filas_actualizacion else pd.DataFrame(columns=list(FILES["gastos"][1])+["_idx_existente"])
+                    duplicados_count = len(filas_dup_exacto)
+
+                    st.session_state["_csv_nuevas"] = df_nuevas
+                    st.session_state["_csv_actualizacion"] = df_actualizacion
                     st.session_state["_csv_dup_count"] = duplicados_count
                     st.session_state["_csv_excl_count"] = excluidos_count
                     st.session_state["_csv_usd_count"] = usd_count
                     st.session_state["_csv_usd_sin_convertir"] = usd_sin_convertir
                 except Exception as e:
                     st.error(f"No pude leer el CSV: {e}")
-                    st.session_state.pop("_csv_preview", None)
+                    st.session_state.pop("_csv_nuevas", None)
+                    st.session_state.pop("_csv_actualizacion", None)
             else:
                 st.warning("Pegá el CSV primero.")
 
-        if "_csv_preview" in st.session_state:
-            preview = st.session_state["_csv_preview"]
+        if "_csv_nuevas" in st.session_state:
+            df_nuevas = st.session_state["_csv_nuevas"]
+            df_actualizacion = st.session_state["_csv_actualizacion"]
             dup_count = st.session_state.get("_csv_dup_count", 0)
             excl_count = st.session_state.get("_csv_excl_count", 0)
             usd_count = st.session_state.get("_csv_usd_count", 0)
@@ -1148,40 +1216,81 @@ with tabs[1]:
                 if usd_sin_convertir > 0:
                     st.markdown(f"<div class='warn-strip'>⚠️ {usd_sin_convertir} gasto(s) en USD detectado(s), pero no se pudo consultar la cotización. Quedan con el monto en USD sin convertir — revisalos a mano.</div>", unsafe_allow_html=True)
                 else:
-                    st.markdown(f"<div class='info-strip'>💵 {usd_count} gasto(s) en USD convertido(s) a ARS.</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='info-strip'>💵 {usd_count} gasto(s) en USD convertido(s) a ARS con la cotización del dólar tarjeta del día.</div>", unsafe_allow_html=True)
             if excl_count > 0:
                 st.markdown(f"<div class='info-strip'>🚫 {excl_count} fila(s) excluida(s) — eran pagos de tarjeta o montos negativos.</div>", unsafe_allow_html=True)
             if dup_count > 0:
-                st.markdown(f"<div class='info-strip'>⏭️ {dup_count} movimiento(s) ya existían y se omiten automáticamente.</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='info-strip'>⏭️ {dup_count} movimiento(s) ya estaban cargados IDÉNTICOS y se omiten.</div>", unsafe_allow_html=True)
 
-            if preview.empty:
+            if df_nuevas.empty and df_actualizacion.empty:
                 st.markdown("<div class='empty'><big>✅</big>Nada nuevo para importar.</div>", unsafe_allow_html=True)
             else:
-                st.caption(f"{len(preview)} movimiento(s) nuevo(s) para importar:")
-                for _, r in preview.head(20).iterrows():
-                    cuota_act, cuota_tot = parsear_cuotas(r.get("Cuotas", 1))
-                    cuotas_t = f" · {cuota_act}/{cuota_tot}" if cuota_tot > 1 else ""
-                    st.markdown(
-                        "<div class='tx'>"
-                        f"<div class='tx-ico'>{emoji_cat(str(r.get('Categoria','💳')))}</div>"
-                        "<div class='tx-main'>"
-                        f"<div class='tx-name'>{r.get('Concepto','—')}</div>"
-                        f"<div class='tx-info'>{str(r.get('Fecha',''))[:10] or 'sin fecha'} · {r.get('Tarjeta','')}{cuotas_t}</div>"
-                        "</div>"
-                        f"<div class='tx-amt c-neg'>−{fmt_ars(r.get('Monto',0))}</div>"
-                        "</div>", unsafe_allow_html=True)
-                if len(preview) > 20:
-                    st.caption(f"... y {len(preview)-20} más")
+                if not df_actualizacion.empty:
+                    st.caption(f"🔄 {len(df_actualizacion)} cuota(s) que AVANZAN de número (misma compra, mismo concepto+fecha):")
+                    for _, r in df_actualizacion.head(20).iterrows():
+                        idx_e = int(r["_idx_existente"])
+                        cuota_vieja = gastos_actuales.loc[idx_e, "Cuotas"] if idx_e in gastos_actuales.index else "?"
+                        st.markdown(
+                            "<div class='tx'>"
+                            f"<div class='tx-ico'>{emoji_cat(str(r.get('Categoria','💳')))}</div>"
+                            "<div class='tx-main'>"
+                            f"<div class='tx-name'>{r.get('Concepto','—')}</div>"
+                            f"<div class='tx-info'>{str(r.get('Fecha',''))[:10]} · {cuota_vieja} → {r.get('Cuotas','')}</div>"
+                            "</div>"
+                            f"<div class='tx-amt c-neg'>−{fmt_ars(r.get('Monto',0))}</div>"
+                            "</div>", unsafe_allow_html=True)
+                    if len(df_actualizacion) > 20:
+                        st.caption(f"... y {len(df_actualizacion)-20} más")
 
-                if st.button(f"✅ Confirmar e importar {len(preview)} movimiento(s)", key="confirm_import"):
+                if not df_nuevas.empty:
+                    st.caption(f"🆕 {len(df_nuevas)} movimiento(s) nuevo(s):")
+                    for _, r in df_nuevas.head(20).iterrows():
+                        st.markdown(
+                            "<div class='tx'>"
+                            f"<div class='tx-ico'>{emoji_cat(str(r.get('Categoria','💳')))}</div>"
+                            "<div class='tx-main'>"
+                            f"<div class='tx-name'>{r.get('Concepto','—')}</div>"
+                            f"<div class='tx-info'>{str(r.get('Fecha',''))[:10] or 'sin fecha'} · {r.get('Tarjeta','')}</div>"
+                            "</div>"
+                            f"<div class='tx-amt c-neg'>−{fmt_ars(r.get('Monto',0))}</div>"
+                            "</div>", unsafe_allow_html=True)
+                    if len(df_nuevas) > 20:
+                        st.caption(f"... y {len(df_nuevas)-20} más")
+
+                total_a_importar = len(df_nuevas) + len(df_actualizacion)
+                if st.button(f"✅ Confirmar ({len(df_nuevas)} nuevo(s), {len(df_actualizacion)} actualización(es))", key="confirm_import"):
                     base = load("gastos")
                     base["Monto"] = to_num(base["Monto"])
-                    final = pd.concat([base, preview], ignore_index=True)
-                    final = sort_by_fecha(final)
-                    save("gastos", final)
-                    st.session_state.pop("_csv_preview", None)
+                    base["Cuanto recupero"] = to_num(base["Cuanto recupero"])
+                    if "Periodo" not in base.columns:
+                        base["Periodo"] = base["Fecha"]
+
+                    # Determinar el Periodo de esta importación: el ciclo
+                    # actual de la tarjeta elegida (todas las filas de un
+                    # mismo resumen pertenecen al mismo ciclo).
+                    periodo_import = calcular_periodo_de_importacion(tarjeta_import, tarjetas_df)
+
+                    # Aplicar actualizaciones (cuota avanzó): se modifica la
+                    # fila existente in-place, Fecha NUNCA se toca.
+                    for _, r in df_actualizacion.iterrows():
+                        idx_e = int(r["_idx_existente"])
+                        if idx_e in base.index:
+                            base.loc[idx_e, "Cuotas"] = r["Cuotas"]
+                            base.loc[idx_e, "Periodo"] = periodo_import
+                            base.loc[idx_e, "Monto"] = r["Monto"]  # por si el monto varió (ajuste del banco)
+
+                    # Agregar filas nuevas, con Periodo = ciclo actual
+                    if not df_nuevas.empty:
+                        df_nuevas_final = df_nuevas.copy()
+                        df_nuevas_final["Periodo"] = periodo_import
+                        base = pd.concat([base, df_nuevas_final], ignore_index=True)
+
+                    base = sort_by_fecha(base)
+                    save("gastos", base)
+                    st.session_state.pop("_csv_nuevas", None)
+                    st.session_state.pop("_csv_actualizacion", None)
                     st.session_state.pop("_csv_dup_count", None)
-                    st.success(f"✅ {len(preview)} movimientos importados.")
+                    st.success(f"✅ {len(df_nuevas)} movimiento(s) nuevo(s), {len(df_actualizacion)} cuota(s) actualizada(s).")
                     st.rerun()
 
     with st.expander("📤 Exportar / Backup de todos los gastos"):
@@ -1207,27 +1316,38 @@ with tabs[1]:
             c1,c2 = st.columns(2)
             g_m  = c1.number_input("Monto x cuota $", min_value=0.0, step=500.0,
                                     help="Si es en cuotas, poné el valor de UNA cuota")
-            g_cu = c2.number_input("Cuotas", min_value=1, max_value=48, value=1)
             c3,c4 = st.columns(2)
-            g_t = c3.selectbox("Tarjeta", TARJETAS)
-            g_k = c4.selectbox("Categoría", CAT_GASTOS)
+            g_cu_act = c3.number_input("Cuota actual", min_value=1, max_value=48, value=1,
+                                        help="Ej: si tu resumen dice 'Cuota 5/12', poné 5 acá")
+            g_cu_tot = c4.number_input("Cuota total", min_value=1, max_value=48, value=1)
             c5,c6 = st.columns(2)
-            g_f    = c5.date_input("Fecha", value=date.today())
-            g_comp = c6.selectbox("Compartido", ["No","Sí"])
+            g_t = c5.selectbox("Tarjeta", TARJETAS)
+            g_k = c6.selectbox("Categoría", CAT_GASTOS)
             c7,c8 = st.columns(2)
-            g_quien = c7.text_input("Con quién", placeholder="Nombre")
-            g_rec   = c8.number_input("Recuperás $ (por cuota)", min_value=0.0, step=100.0) if g_comp == "Sí" else 0.0
+            g_f    = c7.date_input("Fecha de compra original", value=date.today(),
+                                    help="La fecha real en que se hizo la compra — para una cuota vieja, NO es hoy")
+            g_comp = c8.selectbox("Compartido", ["No","Sí"])
+            c9,c10 = st.columns(2)
+            g_quien = c9.text_input("Con quién", placeholder="Nombre")
+            g_rec   = c10.number_input("Recuperás $ (por cuota)", min_value=0.0, step=100.0) if g_comp == "Sí" else 0.0
             g_nota  = st.text_input("Nota", placeholder="Opcional")
             if st.form_submit_button("Guardar gasto"):
                 if g_c.strip() and g_m > 0:
-                    # FIX PROBLEMA 4: genera N filas reales (una por cuota) en
-                    # vez de una sola fila con "Cuotas"=N.
-                    nv = generar_filas_cuotas(g_f, g_c.strip(), g_m, g_t, int(g_cu),
-                                               g_k, g_comp, g_quien.strip(), g_rec, g_nota)
+                    # MODELO NUEVO: una sola fila con la Fecha de compra real
+                    # (intacta, no se inventan fechas de otras cuotas) y
+                    # Periodo = ciclo actual de la tarjeta (esta carga
+                    # corresponde a lo que pagás ESTE mes).
+                    periodo_hoy = calcular_periodo_de_importacion(g_t, tarjetas_df)
+                    nv = pd.DataFrame([{
+                        "Fecha": fmt_fecha(g_f), "Concepto": g_c.strip(), "Monto": g_m,
+                        "Tarjeta": g_t, "Cuotas": fmt_cuotas(int(g_cu_act), int(g_cu_tot)),
+                        "Categoria": g_k, "Compartido": g_comp, "Con quien": g_quien.strip(),
+                        "Cuanto recupero": g_rec, "Notas": g_nota, "Periodo": periodo_hoy,
+                    }])
                     gastos_df = pd.concat([gastos_df, nv], ignore_index=True)
                     gastos_df = sort_by_fecha(gastos_df)
                     save("gastos", gastos_df)
-                    st.success(f"Guardado: {g_c} — {fmt_ars(g_m)}" + (f" x{g_cu} cuotas" if g_cu > 1 else ""))
+                    st.success(f"Guardado: {g_c} — {fmt_ars(g_m)}" + (f" (cuota {g_cu_act}/{g_cu_tot})" if g_cu_tot > 1 else ""))
                     st.rerun()
                 else:
                     st.warning("Completá concepto y monto.")
@@ -1270,6 +1390,35 @@ with tabs[1]:
                                 save("gastos", gastos_df)
                                 st.rerun()
                     st.divider()
+
+    with st.expander("🧹 Limpiar cuotas del modelo viejo"):
+        st.markdown(
+            "<div class='warn-strip'>Esta app cambió cómo guarda las cuotas: antes generaba una fecha "
+            "futura inventada por cada cuota; ahora respeta la fecha real de compra que trae tu resumen "
+            "y solo actualiza el número de cuota al reimportar. Si cargaste compras en cuotas con la "
+            "versión anterior, esos datos quedaron con fechas inventadas y conviene borrarlos para "
+            "volver a importar los resúmenes reales de cada mes.</div>",
+            unsafe_allow_html=True
+        )
+        candidatos_viejo, cant_viejo = eliminar_cuotas_modelo_viejo(gastos_df)
+        if cant_viejo == 0:
+            st.caption("No se encontraron gastos en cuotas para limpiar.")
+        else:
+            st.caption(f"Se encontraron {cant_viejo} fila(s) en cuotas (cualquier compra con más de 1 cuota total).")
+            if st.button(f"🗑️ Borrar {cant_viejo} fila(s) en cuotas", key="limpiar_modelo_viejo"):
+                st.session_state["_confirmar_limpieza_cuotas"] = True
+            if st.session_state.get("_confirmar_limpieza_cuotas"):
+                st.warning(f"¿Confirmás borrar las {cant_viejo} filas en cuotas? Después vas a poder reimportar los resúmenes reales de cada mes.")
+                cc1, cc2 = st.columns(2)
+                if cc1.button("Sí, borrar", key="confirm_limpieza_cuotas"):
+                    gastos_limpio, _ = eliminar_cuotas_modelo_viejo(gastos_df)
+                    save("gastos", gastos_limpio)
+                    st.session_state["_confirmar_limpieza_cuotas"] = False
+                    st.success(f"{cant_viejo} fila(s) en cuotas eliminada(s).")
+                    st.rerun()
+                if cc2.button("Cancelar", key="cancel_limpieza_cuotas"):
+                    st.session_state["_confirmar_limpieza_cuotas"] = False
+                    st.rerun()
 
     with st.expander("🗑️ Eliminar gastos"):
         PALABRAS_EXCLUIR = ["su pago en pesos", "pago en pesos", "saldo anterior", "pago tarjeta"]
@@ -1547,7 +1696,7 @@ with tabs[2]:
             num_rows="dynamic",
             use_container_width=True,
             column_config={
-                "Fecha":           st.column_config.DateColumn("Fecha"),
+                "Fecha":           st.column_config.DateColumn("Fecha compra", help="Fecha real de la compra original — para una cuota vieja, NO es de este mes"),
                 "Concepto":        st.column_config.TextColumn("Concepto"),
                 "Monto":           st.column_config.NumberColumn("Monto $", format="$%d", min_value=0),
                 "Cuota actual":    st.column_config.NumberColumn("Cuota actual", min_value=1, max_value=48, step=1, help="Independiente — no afecta a las otras cuotas"),
@@ -1596,6 +1745,23 @@ with tabs[2]:
             _cuota_tot_col = pd.to_numeric(nuevas.get("Cuota total", 1), errors="coerce").fillna(1).astype(int)
             nuevas["Cuotas"] = [fmt_cuotas(a, t) for a, t in zip(_cuota_act_col, _cuota_tot_col)]
             nuevas = nuevas.drop(columns=["Cuota actual", "Cuota total"], errors="ignore")
+
+            # FIX: preservar "Periodo" de las filas que YA existían (alineadas
+            # por posición con df_per_con_id, igual que hace el log de
+            # historial más abajo). Sin esto, el bloque "completar columnas
+            # faltantes" de abajo las llenaría con "" — perdiendo el ciclo al
+            # que pertenece cada fila, y haciéndola desaparecer del período
+            # la próxima vez que se calcule el total. Filas NUEVAS (agregadas
+            # a mano en esta misma tabla) heredan el Periodo del período que
+            # se está viendo ahora mismo (inicio_p/fin_p).
+            periodos_previos = list(df_per_con_id["Periodo"]) if "Periodo" in df_per_con_id.columns else []
+            n_previas = len(periodos_previos)
+            periodo_de_esta_vista = fin_p.strftime("%Y-%m-%d")
+            nuevas["Periodo"] = [
+                periodos_previos[i] if i < n_previas else periodo_de_esta_vista
+                for i in range(len(nuevas))
+            ]
+
             for col in FILES["gastos"][1]:
                 if col not in nuevas.columns:
                     nuevas[col] = ""
@@ -1795,7 +1961,11 @@ with tabs[4]:
             persona_sel = st.selectbox("Ver detalle por período de", ["— elegí una persona —"] + personas_lista, key="persona_detalle_sel")
             if persona_sel != "— elegí una persona —":
                 det_persona = con_persona_df[con_persona_df["Con quien"] == persona_sel].copy()
-                det_persona["_periodo"] = pd.to_datetime(det_persona["Fecha"], errors="coerce").dt.to_period("M")
+                # Usa Periodo (ciclo de tarjeta), no Fecha (compra real) — una
+                # cuota vieja compartida puede tener Fecha de meses atrás pero
+                # corresponder al período actual.
+                columna_periodo_cp = det_persona["Periodo"] if "Periodo" in det_persona.columns else det_persona["Fecha"]
+                det_persona["_periodo"] = pd.to_datetime(columna_periodo_cp, errors="coerce").dt.to_period("M")
                 por_periodo = det_persona.groupby("_periodo").agg(
                     total_gastado=("Monto", "sum"), total_recupero=("Cuanto recupero", "sum")
                 ).reset_index().sort_values("_periodo", ascending=False)
@@ -1828,8 +1998,11 @@ with tabs[4]:
 
         else:  # modo == "Período"
             # VISTA 2: elegís un período (mes calendario) y ves el total
-            # compartido en ese mes, desagregado por persona.
-            con_persona_df["_periodo"] = pd.to_datetime(con_persona_df["Fecha"], errors="coerce").dt.to_period("M")
+            # compartido en ese mes, desagregado por persona. Usa Periodo
+            # (ciclo de tarjeta), no Fecha — mismo motivo que la vista por
+            # persona arriba.
+            columna_periodo_cp2 = con_persona_df["Periodo"] if "Periodo" in con_persona_df.columns else con_persona_df["Fecha"]
+            con_persona_df["_periodo"] = pd.to_datetime(columna_periodo_cp2, errors="coerce").dt.to_period("M")
             periodos_disponibles = sorted(con_persona_df["_periodo"].dropna().unique(), reverse=True)
 
             if not periodos_disponibles:
@@ -1874,6 +2047,3 @@ with tabs[4]:
                         f"<div class='tx-amt c-yel'>{fmt_ars(r.get('Cuanto recupero',0))}</div>"
                         "</div>", unsafe_allow_html=True
                     )
-
-
-```
