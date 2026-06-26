@@ -566,7 +566,7 @@ def obtener_cotizacion_dolar_tarjeta():
     """Consulta la cotización del 'dólar tarjeta' (oficial + impuestos PAIS/
     ganancias). Cacheada 1 hora. Devuelve el valor de VENTA."""
     try:
-        resp = requests.get("https://dolarapi.com/v1/dolares/tarjeta", timeout=5)
+        resp = requests.get("[https://dolarapi.com/v1/dolares/tarjeta](https://dolarapi.com/v1/dolares/tarjeta)", timeout=5)
         resp.raise_for_status()
         data = resp.json()
         venta = float(data.get("venta", 0))
@@ -706,7 +706,7 @@ st.set_page_config(page_title="Biyuyo", layout="centered", initial_sidebar_state
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+@import url('[https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap](https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap)');
 *,*::before,*::after{box-sizing:border-box}
 html,body,[class*="css"],.stApp{font-family:'DM Sans',sans-serif!important;background-color:#080810!important;color:#dde0f0!important;-webkit-font-smoothing:antialiased}
 #MainMenu,header,footer{visibility:hidden}
@@ -1874,5 +1874,6 @@ with tabs[4]:
                         f"<div class='tx-amt c-yel'>{fmt_ars(r.get('Cuanto recupero',0))}</div>"
                         "</div>", unsafe_allow_html=True
                     )
+
 
 ```
