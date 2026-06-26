@@ -1040,7 +1040,12 @@ with tabs[1]:
             unsafe_allow_html=True
         )
         csv_text = st.text_area("", placeholder="Fecha,Concepto,Monto,Cuotas\n2026-05-24,MERPAGO*SOFIACARLINI,16476.46,1\n...", height=140, label_visibility="collapsed", key="csv_import_text")
-        tarjeta_import = st.selectbox("Tarjeta para estos movimientos (si el CSV no la trae)", TARJETAS, key="tarjeta_import_sel")
+        
+        c_usd1, c_usd2 = st.columns(2)
+        with c_usd1:
+            tarjeta_import = st.selectbox("Tarjeta (si el CSV no la trae)", TARJETAS, key="tarjeta_import_sel")
+        with c_usd2:
+            cotiz_manual = st.number_input("Cotización USD (0 = automática)", min_value=0.0, step=10.0, value=0.0, help="Si dejás 0, consulta la API oficial en vivo. Si tu resumen tiene una cotización exacta, mandala acá para que no te genere un 'posible duplicado' en el futuro por diferencias de centavos.")
 
         if st.button("🔍 Previsualizar", key="preview_csv"):
             if csv_text.strip():
@@ -1069,7 +1074,11 @@ with tabs[1]:
                     usd_count = int(usd_mask.sum())
                     usd_sin_convertir = 0
                     if usd_count > 0:
-                        cotiz = obtener_cotizacion_dolar_tarjeta()
+                        if cotiz_manual > 0:
+                            cotiz = float(cotiz_manual)
+                        else:
+                            cotiz = obtener_cotizacion_dolar_tarjeta()
+                            
                         if cotiz:
                             nuevos.loc[usd_mask, "Notas"] = nuevos.loc[usd_mask, "Notas"].astype(str) + f" [USD→ARS @ ${cotiz:,.2f}]"
                             nuevos.loc[usd_mask, "Monto"] = nuevos.loc[usd_mask, "Monto"].apply(
@@ -1085,21 +1094,27 @@ with tabs[1]:
                     excluidos_count = int(es_pago_mask.sum())
                     nuevos = nuevos[~es_pago_mask].copy()
 
-                    # FIX PROBLEMA 4: expandir cuotas a filas reales ANTES de
-                    # chequear duplicados (cada cuota se compara individualmente
-                    # contra lo ya guardado, evitando reimportar una cuota que
-                    # ya se había cargado a mano en un mes anterior).
+                    # FIX CUOTAS: expandir cuotas a filas reales ANTES de
+                    # chequear duplicados. La fecha del CSV del banco es la FECHA DE COMPRA (Cuota 1).
                     filas_expandidas = []
                     for _, r in nuevos.iterrows():
                         actual, total = parsear_cuotas(r.get("Cuotas", 1))
                         try:
-                            fecha_ancla = datetime.strptime(str(r["Fecha"])[:10], "%Y-%m-%d").date()
+                            fecha_compra = datetime.strptime(str(r["Fecha"])[:10], "%Y-%m-%d").date()
                         except (ValueError, TypeError):
-                            fecha_ancla = None
-                        if total <= 1 or fecha_ancla is None:
+                            fecha_compra = None
+                            
+                        if total <= 1 or fecha_compra is None:
                             filas_expandidas.append(r.to_dict())
                         else:
-                            filas_expandidas.extend(_generar_filas_cuotas_desde_ancla(fecha_ancla, actual, total, r.to_dict()))
+                            # Proyectar siempre desde la fecha de compra original hacia adelante
+                            for n_cuota in range(1, total + 1):
+                                fecha_cuota = _sumar_meses(fecha_compra, n_cuota - 1)
+                                nueva = dict(r.to_dict())
+                                nueva["Fecha"] = fecha_cuota.strftime("%Y-%m-%d")
+                                nueva["Cuotas"] = fmt_cuotas(n_cuota, total)
+                                filas_expandidas.append(nueva)
+                                
                     nuevos = pd.DataFrame(filas_expandidas, columns=FILES["gastos"][1]) if filas_expandidas else nuevos
                     nuevos["Monto"] = to_num(nuevos["Monto"])
 
@@ -1133,7 +1148,7 @@ with tabs[1]:
                 if usd_sin_convertir > 0:
                     st.markdown(f"<div class='warn-strip'>⚠️ {usd_sin_convertir} gasto(s) en USD detectado(s), pero no se pudo consultar la cotización. Quedan con el monto en USD sin convertir — revisalos a mano.</div>", unsafe_allow_html=True)
                 else:
-                    st.markdown(f"<div class='info-strip'>💵 {usd_count} gasto(s) en USD convertido(s) a ARS con la cotización del dólar tarjeta del día.</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='info-strip'>💵 {usd_count} gasto(s) en USD convertido(s) a ARS.</div>", unsafe_allow_html=True)
             if excl_count > 0:
                 st.markdown(f"<div class='info-strip'>🚫 {excl_count} fila(s) excluida(s) — eran pagos de tarjeta o montos negativos.</div>", unsafe_allow_html=True)
             if dup_count > 0:
@@ -1144,12 +1159,14 @@ with tabs[1]:
             else:
                 st.caption(f"{len(preview)} movimiento(s) nuevo(s) para importar:")
                 for _, r in preview.head(20).iterrows():
+                    cuota_act, cuota_tot = parsear_cuotas(r.get("Cuotas", 1))
+                    cuotas_t = f" · {cuota_act}/{cuota_tot}" if cuota_tot > 1 else ""
                     st.markdown(
                         "<div class='tx'>"
                         f"<div class='tx-ico'>{emoji_cat(str(r.get('Categoria','💳')))}</div>"
                         "<div class='tx-main'>"
                         f"<div class='tx-name'>{r.get('Concepto','—')}</div>"
-                        f"<div class='tx-info'>{str(r.get('Fecha',''))[:10] or 'sin fecha'} · {r.get('Tarjeta','')}</div>"
+                        f"<div class='tx-info'>{str(r.get('Fecha',''))[:10] or 'sin fecha'} · {r.get('Tarjeta','')}{cuotas_t}</div>"
                         "</div>"
                         f"<div class='tx-amt c-neg'>−{fmt_ars(r.get('Monto',0))}</div>"
                         "</div>", unsafe_allow_html=True)
@@ -1857,3 +1874,5 @@ with tabs[4]:
                         f"<div class='tx-amt c-yel'>{fmt_ars(r.get('Cuanto recupero',0))}</div>"
                         "</div>", unsafe_allow_html=True
                     )
+
+```
