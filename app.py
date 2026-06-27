@@ -567,6 +567,32 @@ def ciclo_actual_de_tarjeta(tarjeta_nombre, tarjetas_df):
         return min(posteriores)
     return max(ciclos) if ciclos else (date(hoy.year, hoy.month, 1), date(hoy.year, hoy.month, calendar.monthrange(hoy.year, hoy.month)[1]))
 
+def ciclo_por_offset_de_tarjeta(tarjeta_nombre, tarjetas_df, offset):
+    """Devuelve el ciclo de la tarjeta `offset` posiciones relativas al
+    ciclo actual (offset=0 -> actual, -1 -> anterior, +1 -> siguiente).
+    Permite que el selector de período de Home navegue "1 mes atrás/
+    adelante" de forma coherente para todas las tarjetas a la vez, aunque
+    cada una cierre en un día distinto del mes."""
+    tarjetas_csv = tarjetas_df.to_csv(index=False) if not tarjetas_df.empty else ""
+    ciclos = sorted(listar_ciclos_tarjeta(tarjeta_nombre, tarjetas_csv, n_pasados=10, n_futuros=10))
+    hoy = date.today()
+    idx_actual = None
+    for i, (ini, fin) in enumerate(ciclos):
+        if ini <= hoy <= fin:
+            idx_actual = i
+            break
+    if idx_actual is None and ciclos:
+        idx_actual = min(range(len(ciclos)), key=lambda i: abs((ciclos[i][1] - hoy).days))
+    if idx_actual is None:
+        return ciclo_actual_de_tarjeta(tarjeta_nombre, tarjetas_df)
+    idx_final = idx_actual + offset
+    if 0 <= idx_final < len(ciclos):
+        return ciclos[idx_final]
+    # Si se pide un offset fuera del rango generado, extender con el cálculo
+    # simple de "un ciclo más" en la dirección correspondiente
+    ultimo = ciclos[-1] if offset > 0 else ciclos[0]
+    return ultimo
+
 def filtrar_gastos_tarjeta_rango(gastos_df, tarjeta_nombre, inicio, fin):
     """Filtra gastos de una tarjeta cuyo PERIODO (no Fecha) cae dentro de
     [inicio, fin]. Usa Periodo, no Fecha, porque Fecha es la fecha real de
@@ -581,6 +607,38 @@ def filtrar_gastos_tarjeta_rango(gastos_df, tarjeta_nombre, inicio, fin):
     fechas = pd.to_datetime(columna_periodo, errors="coerce").dt.date
     mask_rango = fechas.notna() & (fechas >= inicio) & (fechas <= fin)
     return gastos_df[mask_tarjeta & mask_rango].copy()
+
+# ── Estimación de cuotas futuras (NO oficial, ver aclaración en UI) ────────────
+def estimar_cuotas_en_periodo_futuro(gastos_df, tarjeta_nombre, fin_periodo):
+    """Para compras en cuotas activas (cuota actual < cuota total) de una
+    tarjeta, ESTIMA cuál sería su número de cuota en un período futuro,
+    asumiendo que el banco sigue facturando +1 cuota por ciclo desde el
+    último Periodo conocido. Esto es una proyección, NO el dato real del
+    banco — el banco podría refacturar distinto (raro, pero posible). Se
+    usa solo para anticipar cuánto vas a pagar antes de tener el resumen
+    real de ese mes; nunca se mezcla ni se guarda junto a los datos reales."""
+    if gastos_df.empty:
+        return pd.DataFrame(columns=list(gastos_df.columns) + ["Cuota estimada"])
+    df = gastos_df[gastos_df["Tarjeta"].astype(str).str.strip() == tarjeta_nombre.strip()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=list(gastos_df.columns) + ["Cuota estimada"])
+    filas_est = []
+    for _, r in df.iterrows():
+        actual, total = parsear_cuotas(r.get("Cuotas", 1))
+        if total <= 1 or actual >= total:
+            continue
+        periodo_str = str(r.get("Periodo", r.get("Fecha", "")))[:10]
+        try:
+            periodo_date = datetime.strptime(periodo_str, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        delta_meses = (fin_periodo.year - periodo_date.year) * 12 + (fin_periodo.month - periodo_date.month)
+        cuota_estimada = actual + delta_meses
+        if delta_meses > 0 and cuota_estimada <= total:
+            fila = r.copy()
+            fila["Cuota estimada"] = f"{cuota_estimada}/{total}"
+            filas_est.append(fila)
+    return pd.DataFrame(filas_est) if filas_est else pd.DataFrame(columns=list(gastos_df.columns) + ["Cuota estimada"])
 
 def get_color_tarjeta(tname, tarjetas_df):
     if not tarjetas_df.empty and tname in tarjetas_df["Nombre"].values:
@@ -979,112 +1037,136 @@ if st.session_state.menu_accion:
 tabs = st.tabs(["Inicio","Gastos","Tarjetas","Ingresos","Compartidos"])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 0 — INICIO
+# TAB 0 — INICIO (rediseño: selector de período + 4 métricas + resúmenes)
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[0]:
-    color_hero = "c-pos" if remanente >= 0 else "c-neg"
+    # Selector de período: navega por offset relativo al ciclo ACTUAL de la
+    # tarjeta principal (offset=0). Cada tarjeta calcula su propio ciclo
+    # para ese mismo offset (ciclo_por_offset_de_tarjeta), así que aunque
+    # cierren en días distintos, "un mes atrás" significa lo mismo para
+    # todas a la vez — a pedido explícito (selector de período en Home).
+    if "_home_offset" not in st.session_state:
+        st.session_state["_home_offset"] = 0
+    _tarjeta_principal_home = get_tarjeta_principal(gastos_df, tarjetas_df)
+    c_prev, c_label, c_next = st.columns([1, 3, 1])
+    with c_prev:
+        if st.button("◀", key="home_periodo_prev"):
+            st.session_state["_home_offset"] -= 1
+            st.rerun()
+    _ini_home_sel, _fin_home_sel = ciclo_por_offset_de_tarjeta(_tarjeta_principal_home, tarjetas_df, st.session_state["_home_offset"])
+    with c_label:
+        _label_periodo_home = f"{calendar.month_name[_fin_home_sel.month].capitalize()} {_fin_home_sel.year}"
+        if st.session_state["_home_offset"] == 0:
+            _label_periodo_home += " · actual"
+        st.markdown(f"<div style='text-align:center;font-size:0.78rem;color:#888;padding-top:0.4rem'>{_label_periodo_home}</div>", unsafe_allow_html=True)
+    with c_next:
+        if st.button("▶", key="home_periodo_next"):
+            st.session_state["_home_offset"] += 1
+            st.rerun()
+
+    # Recalcular las 4 métricas para el período seleccionado (no siempre el
+    # actual — el usuario puede navegar). Cada tarjeta usa SU propio ciclo
+    # para ese mismo offset.
+    _gastos_periodo_home = []
+    for _tname in TARJETAS:
+        _ini_t, _fin_t = ciclo_por_offset_de_tarjeta(_tname, tarjetas_df, st.session_state["_home_offset"])
+        _gf = filtrar_gastos_tarjeta_rango(gastos_df, _tname, _ini_t, _fin_t)
+        if not _gf.empty:
+            _gastos_periodo_home.append(_gf)
+    gastos_periodo_home = pd.concat(_gastos_periodo_home, ignore_index=True) if _gastos_periodo_home else gastos_df.iloc[0:0]
+
+    _ini_principal, _fin_principal = ciclo_por_offset_de_tarjeta(_tarjeta_principal_home, tarjetas_df, st.session_state["_home_offset"])
+    ingresos_periodo_home = ingresos_df[
+        pd.to_datetime(ingresos_df["Fecha"], errors="coerce").dt.date.between(_ini_principal, _fin_principal)
+    ] if not ingresos_df.empty else ingresos_df
+
+    deuda_total_periodo = gastos_periodo_home["Monto"].sum() if not gastos_periodo_home.empty else 0
+    recupero_periodo = gastos_periodo_home["Cuanto recupero"].sum() if not gastos_periodo_home.empty else 0
+    ingresos_periodo = ingresos_periodo_home["Monto"].sum() if not ingresos_periodo_home.empty else 0
+    remanente_periodo = ingresos_periodo - deuda_total_periodo + recupero_periodo
+
+    # HERO: 4 métricas grandes — deuda total, te deben, ingresos, remanente.
+    color_hero = "c-pos" if remanente_periodo >= 0 else "c-neg"
     st.markdown(
         "<div class='hero-block'>"
-        f"<div class='hero-eyebrow'>{nombre_mes} {y} · remanente</div>"
-        f"<div class='hero-num {color_hero}'>{fmt_ars(remanente)}</div>"
+        f"<div class='hero-eyebrow'>{_label_periodo_home} · remanente</div>"
+        f"<div class='hero-num {color_hero}'>{fmt_ars(remanente_periodo)}</div>"
         "<div class='hero-sub'>ingresos − gastos + recupero</div>"
         "</div>", unsafe_allow_html=True)
 
-    recup_cell = ""
-    if recupero > 0:
-        recup_cell = (
-            "<div class='stat-cell'>"
-            "<div class='stat-label'>Recuperás</div>"
-            f"<div class='stat-val c-yel'>{fmt_ars(recupero)}</div>"
-            "</div>"
-        )
     st.markdown(
         "<div class='stat-row'>"
-        f"<div class='stat-cell'><div class='stat-label'>Entró</div><div class='stat-val c-pos'>{fmt_ars(total_ing)}</div></div>"
-        f"<div class='stat-cell'><div class='stat-label'>Salió</div><div class='stat-val c-neg'>{fmt_ars(total_gast)}</div></div>"
-        f"{recup_cell}"
+        f"<div class='stat-cell'><div class='stat-label'>Deuda total</div><div class='stat-val c-neg'>{fmt_ars(deuda_total_periodo)}</div></div>"
+        f"<div class='stat-cell'><div class='stat-label'>Te deben</div><div class='stat-val c-yel'>{fmt_ars(recupero_periodo)}</div></div>"
+        f"<div class='stat-cell'><div class='stat-label'>Ingresos</div><div class='stat-val c-pos'>{fmt_ars(ingresos_periodo)}</div></div>"
         "</div>", unsafe_allow_html=True)
 
-    # Resumen tarjetas — usa el CICLO REAL de cada tarjeta (el que incluye hoy),
-    # MISMO criterio que usa el selector de período en la pestaña Tarjetas
-    # (FIX problema 2: antes de este fix podían divergir).
-    st.markdown("<div class='sec'>Este período (según cierre de cada tarjeta)</div>", unsafe_allow_html=True)
+    # Resumen por tarjeta (se mantiene, es útil para ver el desglose)
+    st.markdown("<div class='sec'>Por tarjeta</div>", unsafe_allow_html=True)
     tarjetas_con_gasto = {}
-    ciclo_por_tarjeta = {}
-    for tname in TARJETAS:
-        ini_t, fin_t = ciclo_actual_de_tarjeta(tname, tarjetas_df)
-        ciclo_por_tarjeta[tname] = (ini_t, fin_t)
-        gf = filtrar_gastos_tarjeta_rango(gastos_df, tname, ini_t, fin_t)
-        total_t = gf["Monto"].sum() if not gf.empty else 0
-        if total_t > 0:
-            tarjetas_con_gasto[tname] = total_t
+    for _tname in TARJETAS:
+        _gf_t = gastos_periodo_home[gastos_periodo_home["Tarjeta"].astype(str).str.strip() == _tname.strip()] if not gastos_periodo_home.empty else gastos_periodo_home
+        _total_t = _gf_t["Monto"].sum() if not _gf_t.empty else 0
+        if _total_t > 0:
+            tarjetas_con_gasto[_tname] = _total_t
 
     if tarjetas_con_gasto:
         max_t = max(tarjetas_con_gasto.values())
         for tname, total_t in sorted(tarjetas_con_gasto.items(), key=lambda x: -x[1]):
             color = get_color_tarjeta(tname, tarjetas_df)
             pct = int(total_t / max_t * 100) if max_t > 0 else 0
-            ini_t, fin_t = ciclo_por_tarjeta[tname]
-            meta_html = f"<div class='tarjeta-meta-small'>cierra {fin_t.strftime('%d/%m')}</div>"
             bar_fill = f"<div class='tarjeta-bar-fill' style='width:{pct}%;background:{color}'></div>"
             st.markdown(
                 "<div class='tarjeta-row'>"
                 f"<div class='tarjeta-pip' style='background:{color}'></div>"
-                f"<div style='flex:1'><div class='tarjeta-label'>{tname}</div>{meta_html}</div>"
+                f"<div style='flex:1'><div class='tarjeta-label'>{tname}</div></div>"
                 f"<div class='tarjeta-bar-bg'>{bar_fill}</div>"
                 f"<div class='tarjeta-amount c-neg'>{fmt_ars(total_t)}</div>"
                 "</div>", unsafe_allow_html=True)
     else:
-        st.markdown("<div class='empty'><big>💸</big>Sin gastos este período.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='empty'><big>💸</big>Sin gastos en este período.</div>", unsafe_allow_html=True)
 
-    # Últimos movimientos
-    st.markdown("<div class='sec'>Últimos movimientos</div>", unsafe_allow_html=True)
-    _tiene_fecha = pd.to_datetime(gastos_df["Fecha"], errors="coerce").notna()
-    _con_fecha   = gastos_df[_tiene_fecha].head(8)
-    _sin_fecha   = gastos_df[~_tiene_fecha].head(max(0, 8 - len(_con_fecha)))
-    recientes    = pd.concat([_con_fecha, _sin_fecha], ignore_index=True)
-    if recientes.empty:
-        st.markdown("<div class='empty'><big>📋</big>Sin movimientos todavía.</div>", unsafe_allow_html=True)
-    else:
-        for _, r in recientes.iterrows():
-            ico = emoji_cat(str(r.get("Categoria","💳")))
-            fecha_str = str(r.get("Fecha","")) or "sin fecha"
-            tname_r = str(r.get("Tarjeta",""))
-            cuota_act_r, cuota_tot_r = parsear_cuotas(r.get("Cuotas", 1))
-            cuotas_t = f" · {cuota_act_r}/{cuota_tot_r}" if cuota_tot_r > 1 else ""
-            con_quien_r = str(r.get("Con quien","")).strip()
-            comp_chip = f"<span class='chip-comp'>🤝 {con_quien_r}</span>" if con_quien_r else ""
+    # Resumen de GASTOS POR CATEGORÍA (reemplaza "Últimos movimientos")
+    st.markdown("<div class='sec'>Gastos por categoría</div>", unsafe_allow_html=True)
+    if not gastos_periodo_home.empty:
+        _por_cat = gastos_periodo_home.copy()
+        _por_cat["Categoria"] = _por_cat["Categoria"].fillna("💳 Otro").replace("", "💳 Otro")
+        resumen_cat = _por_cat.groupby("Categoria")["Monto"].sum().sort_values(ascending=False)
+        max_cat = resumen_cat.max() if not resumen_cat.empty else 1
+        for cat, monto_cat in resumen_cat.items():
+            pct_cat = int(monto_cat / max_cat * 100) if max_cat > 0 else 0
+            ico_cat = emoji_cat(str(cat))
+            bar_fill_cat = f"<div class='tarjeta-bar-fill' style='width:{pct_cat}%;background:#6c63ff'></div>"
             st.markdown(
-                "<div class='tx'>"
-                f"<div class='tx-ico'>{ico}</div>"
-                "<div class='tx-main'>"
-                f"<div class='tx-name'>{r.get('Concepto','—')}{comp_chip}</div>"
-                f"<div class='tx-info'>{fecha_str} · {tname_r}{cuotas_t}</div>"
-                "</div>"
-                f"<div class='tx-amt c-neg'>−{fmt_ars(r.get('Monto',0))}</div>"
+                "<div class='tarjeta-row'>"
+                f"<div class='tarjeta-pip' style='background:#6c63ff'></div>"
+                f"<div style='flex:1'><div class='tarjeta-label'>{ico_cat} {str(cat).split(' ',1)[-1] if ' ' in str(cat) else cat}</div></div>"
+                f"<div class='tarjeta-bar-bg'>{bar_fill_cat}</div>"
+                f"<div class='tarjeta-amount c-neg'>{fmt_ars(monto_cat)}</div>"
                 "</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='empty'><big>📊</big>Sin gastos para desagregar.</div>", unsafe_allow_html=True)
 
-    # Te deben (compartidos pendientes) — ahora derivado de gastos, no de un
-    # CSV separado (FIX problema 1)
+    # Resumen de DEUDAS POR PERSONA (reemplaza "Te deben" simple)
+    st.markdown("<div class='sec'>Te deben, por persona</div>", unsafe_allow_html=True)
     con_persona_df = gastos_df[gastos_df["Con quien"].astype(str).str.strip() != ""] if not gastos_df.empty else gastos_df
     if not con_persona_df.empty and con_persona_df["Cuanto recupero"].sum() > 0:
-        st.markdown("<div class='sec'>Te deben</div>", unsafe_allow_html=True)
-        pend_home = con_persona_df[con_persona_df["Cuanto recupero"] > 0].sort_values("Fecha", ascending=False).head(6)
-        for _, r in pend_home.iterrows():
+        resumen_personas_home = con_persona_df.groupby("Con quien")["Cuanto recupero"].sum().sort_values(ascending=False)
+        resumen_personas_home = resumen_personas_home[resumen_personas_home > 0]
+        for persona, monto_p in resumen_personas_home.items():
             st.markdown(
-                "<div class='pend-row'>"
-                "<div class='tx-ico'>🤝</div>"
-                "<div class='tx-main'>"
-                f"<div class='tx-name'>{r.get('Concepto','—')}</div>"
-                f"<div class='tx-info'>{r.get('Con quien','')} · {str(r.get('Fecha',''))[:10]}</div>"
-                "</div>"
-                f"<div class='tx-amt c-yel'>{fmt_ars(r.get('Cuanto recupero',0))}</div>"
+                "<div class='tarjeta-row'>"
+                "<div class='tarjeta-pip' style='background:#f5c542'></div>"
+                f"<div style='flex:1'><div class='tarjeta-label'>{persona}</div></div>"
+                f"<div class='tarjeta-amount c-yel'>{fmt_ars(monto_p)}</div>"
                 "</div>", unsafe_allow_html=True)
         st.markdown(
             "<div class='total-strip'>"
             "<span class='total-strip-label'>Total a recuperar</span>"
-            f"<span class='total-strip-val c-yel'>{fmt_ars(con_persona_df['Cuanto recupero'].sum())}</span>"
+            f"<span class='total-strip-val c-yel'>{fmt_ars(resumen_personas_home.sum())}</span>"
             "</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='empty'><big>🤝</big>Nadie te debe nada por ahora.</div>", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1662,15 +1744,86 @@ with tabs[2]:
             f"<span class='total-strip-label'>{t_sel} · este período</span>"
             f"<span class='total-strip-val' style='color:{color_t_sel}'>−{fmt_ars(total_per)}</span>"
             "</div>", unsafe_allow_html=True)
-        st.markdown("<div class='empty'><big>💳</big>Sin gastos en este período.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='empty'><big>💳</big>Sin gastos confirmados en este período.</div>", unsafe_allow_html=True)
+
+        # FIX: si el período consultado no tiene resumen real cargado todavía
+        # (ej: consultaste agosto pero el banco todavía no te dio ese
+        # resumen), mostrar una ESTIMACIÓN de las cuotas que probablemente
+        # sigan activas — a pedido explícito, claramente marcada como tal,
+        # nunca mezclada con datos reales ni guardada en el CSV.
+        estimadas = estimar_cuotas_en_periodo_futuro(gastos_df, t_sel, fin_p)
+        if not estimadas.empty:
+            st.markdown(
+                "<div class='info-strip'>📊 <b>Estimación</b> (no es el resumen oficial del banco — "
+                "vas a confirmar el número real cuando importes el resumen de este mes):</div>",
+                unsafe_allow_html=True
+            )
+            total_estimado = estimadas["Monto"].astype(float).sum()
+            for _, r in estimadas.sort_values("Monto", ascending=False).iterrows():
+                st.markdown(
+                    "<div class='tx'>"
+                    f"<div class='tx-ico'>{emoji_cat(str(r.get('Categoria','💳')))}</div>"
+                    "<div class='tx-main'>"
+                    f"<div class='tx-name'>{r.get('Concepto','—')}<span class='chip-next'>≈ {r['Cuota estimada']}</span></div>"
+                    f"<div class='tx-info'>Fecha compra: {str(r.get('Fecha',''))[:10]}</div>"
+                    "</div>"
+                    f"<div class='tx-amt c-neg'>−{fmt_ars(r.get('Monto',0))}</div>"
+                    "</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div class='total-strip'>"
+                "<span class='total-strip-label'>Total estimado (estas cuotas)</span>"
+                f"<span class='total-strip-val c-yel'>−{fmt_ars(total_estimado)}</span>"
+                "</div>", unsafe_allow_html=True)
     else:
-        # _row_id = posición exacta en el CSV completo (0-indexed), estable
-        # para esta lectura — necesario para poder guardar cambios sin perder
-        # ni duplicar filas que no están en este período.
-        gastos_con_id = gastos_df.reset_index(drop=True).copy()
-        gastos_con_id["_row_id"] = range(len(gastos_con_id))
-        df_per_con_id = filtrar_gastos_tarjeta_rango(gastos_con_id, t_sel, inicio_p, fin_p)
-        row_ids_periodo = list(df_per_con_id["_row_id"].astype(int))
+        # FIX BUG DUPLICADOS: antes, df_ed (el DataFrame base del editor) se
+        # RECONSTRUÍA DESDE CERO en cada rerun (cada celda que se toca en un
+        # st.data_editor dispara un rerun completo del script). Streamlit
+        # mantiene internamente, bajo la misma `key`, los deltas de edición
+        # ya aplicados — pero si el DataFrame base que se le pasa en cada
+        # rerun no es EXACTAMENTE el mismo objeto (aunque el contenido sea
+        # equivalente), Streamlit puede reconciliar mal su estado interno y
+        # terminar re-aplicando altas ya aplicadas, duplicando filas (bug
+        # confirmado y documentado por el equipo de Streamlit, ver issue
+        # streamlit/streamlit#7749). La solución oficial es usar
+        # session_state como ÚNICA fuente de verdad: el DataFrame base se
+        # calcula UNA SOLA VEZ por período (la primera vez que se entra), y
+        # los reruns subsiguientes reutilizan esa misma copia — nunca se
+        # reconstruye desde gastos_df hasta que se guarda explícitamente o
+        # se cambia de período/tarjeta.
+        _key_periodo = f"_df_ed_state_{t_sel}_{inicio_p}_{fin_p}"
+        _key_rowids = f"_row_ids_state_{t_sel}_{inicio_p}_{fin_p}"
+
+        if _key_periodo not in st.session_state:
+            gastos_con_id = gastos_df.reset_index(drop=True).copy()
+            gastos_con_id["_row_id"] = range(len(gastos_con_id))
+            df_per_con_id = filtrar_gastos_tarjeta_rango(gastos_con_id, t_sel, inicio_p, fin_p)
+            row_ids_periodo = list(df_per_con_id["_row_id"].astype(int))
+
+            df_ed = df_per_con_id.drop(columns=["_row_id"], errors="ignore").copy().reset_index(drop=True)
+            df_ed["Fecha"]    = df_ed["Fecha"].apply(lambda x: pd.to_datetime(x, errors="coerce").date() if str(x) not in ("S/F","","nan") else None)
+            df_ed["Monto"]    = pd.to_numeric(df_ed["Monto"], errors="coerce").fillna(0)
+            _cuotas_parseadas = df_ed["Cuotas"].apply(parsear_cuotas)
+            df_ed["Cuota actual"] = _cuotas_parseadas.apply(lambda t: t[0])
+            df_ed["Cuota total"]  = _cuotas_parseadas.apply(lambda t: t[1])
+            df_ed = df_ed.drop(columns=["Cuotas"])
+            df_ed["Cuanto recupero"] = pd.to_numeric(df_ed["Cuanto recupero"], errors="coerce").fillna(0)
+            df_ed["Periodo"] = df_per_con_id["Periodo"].values if "Periodo" in df_per_con_id.columns else df_ed["Fecha"]
+            for c in ["Concepto","Tarjeta","Categoria","Compartido","Con quien","Notas"]:
+                df_ed[c] = df_ed[c].fillna("").astype(str)
+
+            st.session_state[_key_periodo] = df_ed
+            st.session_state[_key_rowids] = row_ids_periodo
+        else:
+            df_ed = st.session_state[_key_periodo]
+            row_ids_periodo = st.session_state[_key_rowids]
+
+        # Limpiar estados de OTROS períodos/tarjetas para no acumular
+        # session_state indefinidamente a medida que el usuario navega.
+        for _k in list(st.session_state.keys()):
+            if _k.startswith("_df_ed_state_") and _k != _key_periodo:
+                del st.session_state[_k]
+            if _k.startswith("_row_ids_state_") and _k != _key_rowids:
+                del st.session_state[_k]
 
         # FIX PROBLEMA 1: "Con quien" se edita DIRECTO en esta misma tabla —
         # no hay alta separada en Compartidos. Al poner un nombre y un monto
@@ -1680,19 +1833,8 @@ with tabs[2]:
         # fila (que ya es una fila materializada, no una proyección) y son
         # editables — pero ojo, cambiar el total acá NO regenera las otras
         # cuotas (cada fila es independiente, a pedido explícito).
-        df_ed = df_per_con_id.drop(columns=["_row_id"], errors="ignore").copy().reset_index(drop=True)
-        df_ed["Fecha"]    = df_ed["Fecha"].apply(lambda x: pd.to_datetime(x, errors="coerce").date() if str(x) not in ("S/F","","nan") else None)
-        df_ed["Monto"]    = pd.to_numeric(df_ed["Monto"], errors="coerce").fillna(0)
-        _cuotas_parseadas = df_ed["Cuotas"].apply(parsear_cuotas)
-        df_ed["Cuota actual"] = _cuotas_parseadas.apply(lambda t: t[0])
-        df_ed["Cuota total"]  = _cuotas_parseadas.apply(lambda t: t[1])
-        df_ed = df_ed.drop(columns=["Cuotas"])
-        df_ed["Cuanto recupero"] = pd.to_numeric(df_ed["Cuanto recupero"], errors="coerce").fillna(0)
-        for c in ["Concepto","Tarjeta","Categoria","Compartido","Con quien","Notas"]:
-            df_ed[c] = df_ed[c].fillna("").astype(str)
-
         edited_per = st.data_editor(
-            df_ed,
+            df_ed.drop(columns=["Periodo"], errors="ignore"),
             num_rows="dynamic",
             use_container_width=True,
             column_config={
@@ -1747,14 +1889,15 @@ with tabs[2]:
             nuevas = nuevas.drop(columns=["Cuota actual", "Cuota total"], errors="ignore")
 
             # FIX: preservar "Periodo" de las filas que YA existían (alineadas
-            # por posición con df_per_con_id, igual que hace el log de
-            # historial más abajo). Sin esto, el bloque "completar columnas
+            # por posición con df_ed, que es la copia estable guardada en
+            # session_state — ver el bloque de arriba sobre el bug de
+            # duplicados). Sin esto, el bloque "completar columnas
             # faltantes" de abajo las llenaría con "" — perdiendo el ciclo al
             # que pertenece cada fila, y haciéndola desaparecer del período
             # la próxima vez que se calcule el total. Filas NUEVAS (agregadas
             # a mano en esta misma tabla) heredan el Periodo del período que
             # se está viendo ahora mismo (inicio_p/fin_p).
-            periodos_previos = list(df_per_con_id["Periodo"]) if "Periodo" in df_per_con_id.columns else []
+            periodos_previos = list(df_ed["Periodo"]) if "Periodo" in df_ed.columns else []
             n_previas = len(periodos_previos)
             periodo_de_esta_vista = fin_p.strftime("%Y-%m-%d")
             nuevas["Periodo"] = [
@@ -1768,17 +1911,22 @@ with tabs[2]:
             nuevas = nuevas[FILES["gastos"][1]]
 
             # Historial de auditoría: detecta si Fecha o Monto cambiaron
-            # respecto a lo que había antes de editar (df_per_con_id), y lo
+            # respecto a lo que había antes de editar (df_ed), y lo
             # registra en un log aparte. No cambia el guardado en sí — cada
             # cuota sigue siendo independiente, esto es solo trazabilidad
             # para poder rastrear después si una cuota "se movió" de período.
-            cambios_detectados = detectar_cambios_fecha_monto(df_per_con_id, nuevas)
+            cambios_detectados = detectar_cambios_fecha_monto(df_ed, nuevas)
             if cambios_detectados:
                 registrar_historial(cambios_detectados)
 
             final = pd.concat([base_limpia, nuevas], ignore_index=True)
             final = sort_by_fecha(final)
             save("gastos", final)
+            # Limpiar el estado guardado del editor: los datos en disco
+            # cambiaron, así que la próxima vez que se entre a este período
+            # hay que recalcular df_ed desde cero (no reusar la copia vieja).
+            st.session_state.pop(_key_periodo, None)
+            st.session_state.pop(_key_rowids, None)
             if cambios_detectados:
                 st.success(f"✅ Guardado. {len(nuevas)} filas actualizadas. {len(cambios_detectados)} cambio(s) registrado(s) en el historial.")
             else:
@@ -1824,10 +1972,15 @@ with tabs[2]:
             st.warning(f"¿Confirmás borrar los {len(df_per)} gastos de {t_sel} en este período ({inicio_p.strftime('%d/%m')}→{fin_p.strftime('%d/%m')})?")
             cc1, cc2 = st.columns(2)
             if cc1.button("Sí, borrar este período", key="confirm_blanq_per"):
-                ids_a_borrar = set(df_per_con_id["_row_id"].astype(int)) if not df_per.empty else set()
-                base = load("gastos")
-                base["_row_id"] = range(len(base))
-                resto = base[~base["_row_id"].isin(ids_a_borrar)].drop(columns=["_row_id"]).reset_index(drop=True)
+                # Recalcular qué filas borrar de forma independiente (no
+                # depende del estado del editor, que puede no existir en
+                # este scope si el período está vacío o si el usuario nunca
+                # llegó a abrir la tabla editable).
+                base_para_borrar = load("gastos")
+                base_para_borrar["_row_id"] = range(len(base_para_borrar))
+                filas_a_borrar = filtrar_gastos_tarjeta_rango(base_para_borrar, t_sel, inicio_p, fin_p)
+                ids_a_borrar = set(filas_a_borrar["_row_id"].astype(int))
+                resto = base_para_borrar[~base_para_borrar["_row_id"].isin(ids_a_borrar)].drop(columns=["_row_id"]).reset_index(drop=True)
                 save("gastos", resto)
                 st.session_state["_confirmar_blanqueo_periodo"] = False
                 st.success("Período vaciado.")
