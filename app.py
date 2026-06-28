@@ -1833,6 +1833,7 @@ with tabs[2]:
         # fila (que ya es una fila materializada, no una proyección) y son
         # editables — pero ojo, cambiar el total acá NO regenera las otras
         # cuotas (cada fila es independiente, a pedido explícito).
+        _editor_key = f"editor_per_{t_sel}_{inicio_p}_{fin_p}"
         edited_per = st.data_editor(
             df_ed.drop(columns=["Periodo"], errors="ignore"),
             num_rows="dynamic",
@@ -1850,14 +1851,55 @@ with tabs[2]:
                 "Tarjeta":         st.column_config.TextColumn("Tarjeta"),
                 "Categoria":       st.column_config.TextColumn("Categoría"),
             },
-            key=f"editor_per_{t_sel}_{inicio_p}_{fin_p}"
+            key=_editor_key
         )
 
-        # Total recalculado en vivo desde la tabla editada (no desde el disco),
-        # y ubicado DEBAJO de la tabla — antes estaba arriba, donde la barra
+        # FIX BUG DUPLICADOS/PÉRDIDA DE FILAS (segunda vuelta): el DataFrame
+        # `edited_per` que devuelve st.data_editor es la versión "reconciliada"
+        # por Streamlit, y hay un bug documentado y confirmado por el equipo
+        # de Streamlit (issue streamlit/streamlit#7749) donde esa
+        # reconciliación queda "un loop de rerun atrasada" cuando el
+        # DataFrame base viene de session_state — el resultado visible es
+        # exactamente lo reportado: ediciones que se duplican o filas que se
+        # pierden al guardar, de forma intermitente. La solución oficial de
+        # Streamlit es no confiar en el DataFrame reconciliado para guardar,
+        # sino leer los DELTAS EXPLÍCITOS que Streamlit guarda aparte, bajo
+        # st.session_state[key]: un dict con "edited_rows" (qué celdas
+        # cambiaron, por índice de fila), "added_rows" (filas nuevas) y
+        # "deleted_rows" (índices borrados). Esos son eventos discretos que
+        # Streamlit nunca duplica ni pierde, a diferencia del DataFrame
+        # reconciliado completo.
+        _delta_editor = st.session_state.get(_editor_key, {})
+        _edited_rows_delta = _delta_editor.get("edited_rows", {})
+        _added_rows_delta = _delta_editor.get("added_rows", [])
+        _deleted_rows_delta = set(_delta_editor.get("deleted_rows", []))
+
+        # Reconstruir manualmente el DataFrame "real" aplicando los deltas
+        # sobre df_ed (la copia estable, nunca la reconciliada por Streamlit).
+        df_ed_sin_periodo = df_ed.drop(columns=["Periodo"], errors="ignore").copy()
+        for _idx_fila, _cambios in _edited_rows_delta.items():
+            _idx_fila = int(_idx_fila)
+            if _idx_fila in df_ed_sin_periodo.index:
+                for _col, _val in _cambios.items():
+                    if _col in df_ed_sin_periodo.columns:
+                        df_ed_sin_periodo.loc[_idx_fila, _col] = _val
+        if _deleted_rows_delta:
+            df_ed_sin_periodo = df_ed_sin_periodo.drop(index=[i for i in _deleted_rows_delta if i in df_ed_sin_periodo.index])
+        if _added_rows_delta:
+            _nuevas_filas_df = pd.DataFrame(_added_rows_delta)
+            for _col in df_ed_sin_periodo.columns:
+                if _col not in _nuevas_filas_df.columns:
+                    _nuevas_filas_df[_col] = "" if df_ed_sin_periodo[_col].dtype == object else 0
+            df_ed_sin_periodo = pd.concat([df_ed_sin_periodo, _nuevas_filas_df[df_ed_sin_periodo.columns]], ignore_index=False)
+
+        edited_per_real = df_ed_sin_periodo.reset_index(drop=True)
+
+        # Total recalculado en vivo desde la tabla RECONSTRUIDA POR DELTAS
+        # (no desde edited_per directamente, por el motivo de arriba), y
+        # ubicado DEBAJO de la tabla — antes estaba arriba, donde la barra
         # de herramientas flotante del data_editor (lupa/descarga/expandir) lo
         # tapaba visualmente en pantallas chicas.
-        total_per_editado = pd.to_numeric(edited_per["Monto"], errors="coerce").fillna(0).sum()
+        total_per_editado = pd.to_numeric(edited_per_real["Monto"], errors="coerce").fillna(0).sum()
         color_t_sel = get_color_tarjeta(t_sel, tarjetas_df)
         st.markdown(
             "<div class='total-strip'>"
@@ -1879,7 +1921,7 @@ with tabs[2]:
 
             base_limpia = base[~base["_row_id"].isin(ids_validos)].drop(columns=["_row_id"]).reset_index(drop=True)
 
-            nuevas = edited_per.copy()
+            nuevas = edited_per_real.copy()
             nuevas["Fecha"]           = nuevas["Fecha"].apply(fmt_fecha)
             nuevas["Monto"]           = to_num(nuevas["Monto"])
             nuevas["Cuanto recupero"] = to_num(nuevas["Cuanto recupero"])
@@ -1888,20 +1930,24 @@ with tabs[2]:
             nuevas["Cuotas"] = [fmt_cuotas(a, t) for a, t in zip(_cuota_act_col, _cuota_tot_col)]
             nuevas = nuevas.drop(columns=["Cuota actual", "Cuota total"], errors="ignore")
 
-            # FIX: preservar "Periodo" de las filas que YA existían (alineadas
-            # por posición con df_ed, que es la copia estable guardada en
-            # session_state — ver el bloque de arriba sobre el bug de
-            # duplicados). Sin esto, el bloque "completar columnas
-            # faltantes" de abajo las llenaría con "" — perdiendo el ciclo al
-            # que pertenece cada fila, y haciéndola desaparecer del período
-            # la próxima vez que se calcule el total. Filas NUEVAS (agregadas
-            # a mano en esta misma tabla) heredan el Periodo del período que
-            # se está viendo ahora mismo (inicio_p/fin_p).
-            periodos_previos = list(df_ed["Periodo"]) if "Periodo" in df_ed.columns else []
-            n_previas = len(periodos_previos)
+            # FIX: preservar "Periodo" de las filas que YA existían. Como
+            # edited_per_real se reconstruyó aplicando deltas sobre df_ed
+            # (que conserva su índice original 0..n-1 salvo las borradas),
+            # se puede mapear el Periodo por ese índice directamente — más
+            # robusto que asumir alineación por posición pura, porque
+            # sobrevive a borrados intermedios sin desalinear las que quedan.
+            _periodo_por_indice_original = dict(zip(df_ed.index, df_ed["Periodo"])) if "Periodo" in df_ed.columns else {}
             periodo_de_esta_vista = fin_p.strftime("%Y-%m-%d")
+            _indices_finales = edited_per_real.index if edited_per_real.index.equals(df_ed_sin_periodo.reset_index(drop=True).index) else range(len(nuevas))
+            # edited_per_real ya viene con reset_index, así que para mapear
+            # Periodo correctamente se reconstruye ANTES del reset (ver
+            # df_ed_sin_periodo previo al reset, que conserva los índices
+            # originales de las filas que no fueron borradas/agregadas).
+            _indices_preservados = [i for i in df_ed.index if i not in _deleted_rows_delta]
+            _periodos_en_orden = [_periodo_por_indice_original.get(i, periodo_de_esta_vista) for i in _indices_preservados]
+            n_previas = len(_periodos_en_orden)
             nuevas["Periodo"] = [
-                periodos_previos[i] if i < n_previas else periodo_de_esta_vista
+                _periodos_en_orden[i] if i < n_previas else periodo_de_esta_vista
                 for i in range(len(nuevas))
             ]
 
@@ -1927,6 +1973,7 @@ with tabs[2]:
             # hay que recalcular df_ed desde cero (no reusar la copia vieja).
             st.session_state.pop(_key_periodo, None)
             st.session_state.pop(_key_rowids, None)
+            st.session_state.pop(_editor_key, None)
             if cambios_detectados:
                 st.success(f"✅ Guardado. {len(nuevas)} filas actualizadas. {len(cambios_detectados)} cambio(s) registrado(s) en el historial.")
             else:
