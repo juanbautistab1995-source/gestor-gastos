@@ -604,8 +604,19 @@ def filtrar_gastos_tarjeta_rango(gastos_df, tarjeta_nombre, inicio, fin):
         return gastos_df.copy()
     mask_tarjeta = gastos_df["Tarjeta"].astype(str).str.strip() == tarjeta_nombre.strip()
     columna_periodo = gastos_df["Periodo"] if "Periodo" in gastos_df.columns else gastos_df["Fecha"]
-    fechas = pd.to_datetime(columna_periodo, errors="coerce").dt.date
-    mask_rango = fechas.notna() & (fechas >= inicio) & (fechas <= fin)
+    fechas_dt = pd.to_datetime(columna_periodo, errors="coerce")
+    # FIX: en pandas reciente, cuando TODA la columna falla el parseo (todo
+    # NaT), ".dt.date" no convierte a un array de objetos date de Python —
+    # se queda en dtype datetime64, y comparar ese dtype contra un date()
+    # de Python con >=/<= lanza TypeError ("Invalid comparison between
+    # dtype=datetime64[s] and date"). Forzar a object/date explícitamente
+    # evita el problema en cualquier versión de pandas, sin importar si hay
+    # 0, algunas, o todas las fechas válidas.
+    fechas = fechas_dt.apply(lambda x: x.date() if pd.notna(x) else None)
+    mask_valida = fechas.notna()
+    mask_rango = pd.Series(False, index=gastos_df.index)
+    if mask_valida.any():
+        mask_rango.loc[mask_valida] = fechas[mask_valida].apply(lambda d: inicio <= d <= fin)
     return gastos_df[mask_tarjeta & mask_rango].copy()
 
 # ── Estimación de cuotas futuras (NO oficial, ver aclaración en UI) ────────────
@@ -1076,9 +1087,19 @@ with tabs[0]:
     gastos_periodo_home = pd.concat(_gastos_periodo_home, ignore_index=True) if _gastos_periodo_home else gastos_df.iloc[0:0]
 
     _ini_principal, _fin_principal = ciclo_por_offset_de_tarjeta(_tarjeta_principal_home, tarjetas_df, st.session_state["_home_offset"])
-    ingresos_periodo_home = ingresos_df[
-        pd.to_datetime(ingresos_df["Fecha"], errors="coerce").dt.date.between(_ini_principal, _fin_principal)
-    ] if not ingresos_df.empty else ingresos_df
+    # FIX: mismo blindaje que filtrar_gastos_tarjeta_rango — evitar comparar
+    # un dtype datetime64 (cuando toda la columna es NaT) contra un date()
+    # de Python, que en pandas reciente lanza TypeError en vez de devolver
+    # False para cada fila.
+    if not ingresos_df.empty:
+        _fechas_ing = pd.to_datetime(ingresos_df["Fecha"], errors="coerce").apply(lambda x: x.date() if pd.notna(x) else None)
+        _mask_ing_valida = _fechas_ing.notna()
+        _mask_ing_rango = pd.Series(False, index=ingresos_df.index)
+        if _mask_ing_valida.any():
+            _mask_ing_rango.loc[_mask_ing_valida] = _fechas_ing[_mask_ing_valida].apply(lambda d: _ini_principal <= d <= _fin_principal)
+        ingresos_periodo_home = ingresos_df[_mask_ing_rango]
+    else:
+        ingresos_periodo_home = ingresos_df
 
     deuda_total_periodo = gastos_periodo_home["Monto"].sum() if not gastos_periodo_home.empty else 0
     recupero_periodo = gastos_periodo_home["Cuanto recupero"].sum() if not gastos_periodo_home.empty else 0
