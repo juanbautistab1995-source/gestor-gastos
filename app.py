@@ -391,20 +391,32 @@ def eliminar_cuotas_modelo_viejo(gastos_df):
 _MIGRACION_FLAG_V2 = ".periodo_v2_activado"
 
 def asegurar_columna_periodo():
-    """Si el CSV de gastos no tiene la columna Periodo (datos de antes de
-    este rediseño), la agrega igualando Periodo = Fecha para gastos sin
-    cuotas. No se ejecuta más de una vez (flag en disco)."""
-    if os.path.exists(_MIGRACION_FLAG_V2):
-        return
+    """Si el CSV de gastos no tiene la columna Periodo poblada (datos de
+    antes de este rediseño, o una corrida anterior de esta misma función
+    que no llegó a completarla — ej. por un crash a mitad de camino), la
+    completa igualando Periodo = Fecha para esas filas.
+    FIX: ya NO depende ciegamente de un flag en disco para decidir si
+    correr — antes, si el flag se creaba en una corrida que fallaba o
+    corría sobre una base vacía/parcial, la migración real NUNCA volvía a
+    intentarse, dejando filas con Periodo vacío para siempre (causa
+    confirmada de que Home y Tarjetas mostraran $0 en todas las tarjetas).
+    Ahora SIEMPRE revisa si hay filas con Periodo vacío y las completa,
+    sin importar el estado del flag — es idempotente y de bajo costo
+    (un load() + comparación de string vacío), así que no hace falta
+    saltarla por performance."""
     gastos_df = load("gastos")
-    if not gastos_df.empty and "Periodo" in gastos_df.columns:
-        falta_periodo = gastos_df["Periodo"].astype(str).str.strip() == ""
-        if falta_periodo.any():
-            gastos_df.loc[falta_periodo, "Periodo"] = gastos_df.loc[falta_periodo, "Fecha"]
-            gastos_df["Monto"] = to_num(gastos_df["Monto"])
-            gastos_df["Cuanto recupero"] = to_num(gastos_df["Cuanto recupero"])
-            save("gastos", gastos_df)
-    open(_MIGRACION_FLAG_V2, "w").close()
+    if gastos_df.empty or "Periodo" not in gastos_df.columns:
+        if not os.path.exists(_MIGRACION_FLAG_V2):
+            open(_MIGRACION_FLAG_V2, "w").close()
+        return
+    falta_periodo = gastos_df["Periodo"].astype(str).str.strip() == ""
+    if falta_periodo.any():
+        gastos_df.loc[falta_periodo, "Periodo"] = gastos_df.loc[falta_periodo, "Fecha"]
+        gastos_df["Monto"] = to_num(gastos_df["Monto"])
+        gastos_df["Cuanto recupero"] = to_num(gastos_df["Cuanto recupero"])
+        save("gastos", gastos_df)
+    if not os.path.exists(_MIGRACION_FLAG_V2):
+        open(_MIGRACION_FLAG_V2, "w").close()
 
 
 
@@ -1066,10 +1078,20 @@ with tabs[0]:
             st.rerun()
     _ini_home_sel, _fin_home_sel = ciclo_por_offset_de_tarjeta(_tarjeta_principal_home, tarjetas_df, st.session_state["_home_offset"])
     with c_label:
+        # Aclarar que este mes corresponde al ciclo de la tarjeta PRINCIPAL
+        # (la más usada) — cada tarjeta puede estar en un rango de fechas
+        # distinto al mismo tiempo (a propósito, ver detalle por tarjeta más
+        # abajo), así que mostrar solo "Julio 2026" sin indicar de qué
+        # tarjeta sugería falsamente que todo el desglose era de ese mismo
+        # mes para todas.
         _label_periodo_home = f"{calendar.month_name[_fin_home_sel.month].capitalize()} {_fin_home_sel.year}"
         if st.session_state["_home_offset"] == 0:
             _label_periodo_home += " · actual"
-        st.markdown(f"<div style='text-align:center;font-size:0.78rem;color:#888;padding-top:0.4rem'>{_label_periodo_home}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='text-align:center;font-size:0.78rem;color:#888;padding-top:0.4rem'>{_label_periodo_home}</div>"
+            f"<div style='text-align:center;font-size:0.62rem;color:#555'>según {_tarjeta_principal_home} · cada tarjeta puede variar</div>",
+            unsafe_allow_html=True
+        )
     with c_next:
         if st.button("▶", key="home_periodo_next"):
             st.session_state["_home_offset"] += 1
@@ -1122,14 +1144,24 @@ with tabs[0]:
         f"<div class='stat-cell'><div class='stat-label'>Ingresos</div><div class='stat-val c-pos'>{fmt_ars(ingresos_periodo)}</div></div>"
         "</div>", unsafe_allow_html=True)
 
-    # Resumen por tarjeta (se mantiene, es útil para ver el desglose)
+    # Resumen por tarjeta. Cada tarjeta muestra SU PROPIO rango de fechas
+    # debajo del nombre — necesario porque cada tarjeta puede tener un ciclo
+    # de cierre distinto, así que aunque el navegador ◀▶ las mueva todas
+    # "un paso" a la vez, el rango de fechas resultante NO es el mismo para
+    # todas (a propósito, confirmado por el usuario). Sin este detalle, el
+    # label de arriba (que solo refleja el ciclo de la tarjeta PRINCIPAL)
+    # daba la falsa impresión de que todos los montos correspondían al mismo
+    # mes calendario.
     st.markdown("<div class='sec'>Por tarjeta</div>", unsafe_allow_html=True)
     tarjetas_con_gasto = {}
+    rango_por_tarjeta = {}
     for _tname in TARJETAS:
+        _ini_t, _fin_t = ciclo_por_offset_de_tarjeta(_tname, tarjetas_df, st.session_state["_home_offset"])
         _gf_t = gastos_periodo_home[gastos_periodo_home["Tarjeta"].astype(str).str.strip() == _tname.strip()] if not gastos_periodo_home.empty else gastos_periodo_home
         _total_t = _gf_t["Monto"].sum() if not _gf_t.empty else 0
         if _total_t > 0:
             tarjetas_con_gasto[_tname] = _total_t
+            rango_por_tarjeta[_tname] = f"{_ini_t.strftime('%d/%m')} → {_fin_t.strftime('%d/%m')}"
 
     if tarjetas_con_gasto:
         max_t = max(tarjetas_con_gasto.values())
@@ -1140,7 +1172,8 @@ with tabs[0]:
             st.markdown(
                 "<div class='tarjeta-row'>"
                 f"<div class='tarjeta-pip' style='background:{color}'></div>"
-                f"<div style='flex:1'><div class='tarjeta-label'>{tname}</div></div>"
+                f"<div style='flex:1'><div class='tarjeta-label'>{tname}</div>"
+                f"<div class='tarjeta-meta-small'>{rango_por_tarjeta[tname]}</div></div>"
                 f"<div class='tarjeta-bar-bg'>{bar_fill}</div>"
                 f"<div class='tarjeta-amount c-neg'>{fmt_ars(total_t)}</div>"
                 "</div>", unsafe_allow_html=True)
@@ -1854,7 +1887,21 @@ with tabs[2]:
         # fila (que ya es una fila materializada, no una proyección) y son
         # editables — pero ojo, cambiar el total acá NO regenera las otras
         # cuotas (cada fila es independiente, a pedido explícito).
-        _editor_key = f"editor_per_{t_sel}_{inicio_p}_{fin_p}"
+        #
+        # NOTA SOBRE EL BUG DE DUPLICADOS/PÉRDIDA DE FILAS: se intentó arreglar
+        # leyendo los deltas crudos de Streamlit (edited_rows/added_rows/
+        # deleted_rows) y reconstruyendo el DataFrame a mano, pero esto
+        # introdujo el MISMO problema por otra vía (no se pudo verificar con
+        # certeza el comportamiento exacto del frontend de Streamlit sin
+        # poder instalarlo en el entorno de prueba). Se volvió al patrón
+        # ESTÁNDAR Y DOCUMENTADO: usar directamente el DataFrame que devuelve
+        # st.data_editor() como fuente de verdad para guardar. La causa real
+        # de los duplicados/pérdidas era que `df_ed` (el argumento que se le
+        # pasa al editor) SÍ debe ser estable entre reruns — lo cual ya se
+        # garantiza guardándolo en session_state y NO reconstruyéndolo en
+        # cada render — pero el VALOR DE RETORNO (edited_per) hay que usarlo
+        # tal cual lo entrega Streamlit, sin "mejorarlo" con reconstrucciones
+        # manuales.
         edited_per = st.data_editor(
             df_ed.drop(columns=["Periodo"], errors="ignore"),
             num_rows="dynamic",
@@ -1872,55 +1919,14 @@ with tabs[2]:
                 "Tarjeta":         st.column_config.TextColumn("Tarjeta"),
                 "Categoria":       st.column_config.TextColumn("Categoría"),
             },
-            key=_editor_key
+            key=f"editor_per_{t_sel}_{inicio_p}_{fin_p}"
         )
 
-        # FIX BUG DUPLICADOS/PÉRDIDA DE FILAS (segunda vuelta): el DataFrame
-        # `edited_per` que devuelve st.data_editor es la versión "reconciliada"
-        # por Streamlit, y hay un bug documentado y confirmado por el equipo
-        # de Streamlit (issue streamlit/streamlit#7749) donde esa
-        # reconciliación queda "un loop de rerun atrasada" cuando el
-        # DataFrame base viene de session_state — el resultado visible es
-        # exactamente lo reportado: ediciones que se duplican o filas que se
-        # pierden al guardar, de forma intermitente. La solución oficial de
-        # Streamlit es no confiar en el DataFrame reconciliado para guardar,
-        # sino leer los DELTAS EXPLÍCITOS que Streamlit guarda aparte, bajo
-        # st.session_state[key]: un dict con "edited_rows" (qué celdas
-        # cambiaron, por índice de fila), "added_rows" (filas nuevas) y
-        # "deleted_rows" (índices borrados). Esos son eventos discretos que
-        # Streamlit nunca duplica ni pierde, a diferencia del DataFrame
-        # reconciliado completo.
-        _delta_editor = st.session_state.get(_editor_key, {})
-        _edited_rows_delta = _delta_editor.get("edited_rows", {})
-        _added_rows_delta = _delta_editor.get("added_rows", [])
-        _deleted_rows_delta = set(_delta_editor.get("deleted_rows", []))
-
-        # Reconstruir manualmente el DataFrame "real" aplicando los deltas
-        # sobre df_ed (la copia estable, nunca la reconciliada por Streamlit).
-        df_ed_sin_periodo = df_ed.drop(columns=["Periodo"], errors="ignore").copy()
-        for _idx_fila, _cambios in _edited_rows_delta.items():
-            _idx_fila = int(_idx_fila)
-            if _idx_fila in df_ed_sin_periodo.index:
-                for _col, _val in _cambios.items():
-                    if _col in df_ed_sin_periodo.columns:
-                        df_ed_sin_periodo.loc[_idx_fila, _col] = _val
-        if _deleted_rows_delta:
-            df_ed_sin_periodo = df_ed_sin_periodo.drop(index=[i for i in _deleted_rows_delta if i in df_ed_sin_periodo.index])
-        if _added_rows_delta:
-            _nuevas_filas_df = pd.DataFrame(_added_rows_delta)
-            for _col in df_ed_sin_periodo.columns:
-                if _col not in _nuevas_filas_df.columns:
-                    _nuevas_filas_df[_col] = "" if df_ed_sin_periodo[_col].dtype == object else 0
-            df_ed_sin_periodo = pd.concat([df_ed_sin_periodo, _nuevas_filas_df[df_ed_sin_periodo.columns]], ignore_index=False)
-
-        edited_per_real = df_ed_sin_periodo.reset_index(drop=True)
-
-        # Total recalculado en vivo desde la tabla RECONSTRUIDA POR DELTAS
-        # (no desde edited_per directamente, por el motivo de arriba), y
-        # ubicado DEBAJO de la tabla — antes estaba arriba, donde la barra
+        # Total recalculado en vivo desde la tabla editada (no desde el disco),
+        # y ubicado DEBAJO de la tabla — antes estaba arriba, donde la barra
         # de herramientas flotante del data_editor (lupa/descarga/expandir) lo
         # tapaba visualmente en pantallas chicas.
-        total_per_editado = pd.to_numeric(edited_per_real["Monto"], errors="coerce").fillna(0).sum()
+        total_per_editado = pd.to_numeric(edited_per["Monto"], errors="coerce").fillna(0).sum()
         color_t_sel = get_color_tarjeta(t_sel, tarjetas_df)
         st.markdown(
             "<div class='total-strip'>"
@@ -1942,7 +1948,7 @@ with tabs[2]:
 
             base_limpia = base[~base["_row_id"].isin(ids_validos)].drop(columns=["_row_id"]).reset_index(drop=True)
 
-            nuevas = edited_per_real.copy()
+            nuevas = edited_per.copy()
             nuevas["Fecha"]           = nuevas["Fecha"].apply(fmt_fecha)
             nuevas["Monto"]           = to_num(nuevas["Monto"])
             nuevas["Cuanto recupero"] = to_num(nuevas["Cuanto recupero"])
@@ -1951,26 +1957,40 @@ with tabs[2]:
             nuevas["Cuotas"] = [fmt_cuotas(a, t) for a, t in zip(_cuota_act_col, _cuota_tot_col)]
             nuevas = nuevas.drop(columns=["Cuota actual", "Cuota total"], errors="ignore")
 
-            # FIX: preservar "Periodo" de las filas que YA existían. Como
-            # edited_per_real se reconstruyó aplicando deltas sobre df_ed
-            # (que conserva su índice original 0..n-1 salvo las borradas),
-            # se puede mapear el Periodo por ese índice directamente — más
-            # robusto que asumir alineación por posición pura, porque
-            # sobrevive a borrados intermedios sin desalinear las que quedan.
-            _periodo_por_indice_original = dict(zip(df_ed.index, df_ed["Periodo"])) if "Periodo" in df_ed.columns else {}
+            # FIX: preservar "Periodo" de las filas que YA existían. Según la
+            # documentación oficial de Streamlit, st.data_editor "no soporta
+            # reordenar filas, así que las filas agregadas siempre se
+            # appendean al final del dataframe, con las ediciones y borrados
+            # aplicados sobre las filas originales" — es decir, las primeras
+            # N filas de `edited_per` (N = filas que YA existían en df_ed,
+            # menos las borradas) preservan su posición relativa original.
+            # Esto permite mapear Periodo por posición simple, sin reconstruir
+            # nada a mano: se toma el Periodo de las primeras `cant_previas`
+            # filas según df_ed (filtrando las que el usuario borró, detectadas
+            # por comparar cuántas hay ahora vs antes), y el resto (filas
+            # nuevas agregadas al final) recibe el Periodo del período actual.
             periodo_de_esta_vista = fin_p.strftime("%Y-%m-%d")
-            _indices_finales = edited_per_real.index if edited_per_real.index.equals(df_ed_sin_periodo.reset_index(drop=True).index) else range(len(nuevas))
-            # edited_per_real ya viene con reset_index, así que para mapear
-            # Periodo correctamente se reconstruye ANTES del reset (ver
-            # df_ed_sin_periodo previo al reset, que conserva los índices
-            # originales de las filas que no fueron borradas/agregadas).
-            _indices_preservados = [i for i in df_ed.index if i not in _deleted_rows_delta]
-            _periodos_en_orden = [_periodo_por_indice_original.get(i, periodo_de_esta_vista) for i in _indices_preservados]
-            n_previas = len(_periodos_en_orden)
-            nuevas["Periodo"] = [
-                _periodos_en_orden[i] if i < n_previas else periodo_de_esta_vista
-                for i in range(len(nuevas))
-            ]
+            cant_originales = len(df_ed)
+            cant_actuales_no_nuevas = min(len(nuevas), cant_originales)
+            # Si se borraron filas, len(nuevas) puede ser menor a cant_originales
+            # sin que haya filas nuevas agregadas — en ese caso, todas las
+            # filas restantes son "viejas" y conservan su Periodo según su
+            # posición entre las que quedaron. Para evitar mapear mal una fila
+            # vieja con el Periodo de otra, se usa el criterio más simple y
+            # robusto: si NO hubo altas nuevas (len(nuevas) <= cant_originales),
+            # todas las filas restantes son viejas; el Periodo correcto de
+            # CADA una se busca por Concepto+Fecha+Monto contra df_ed, no por
+            # posición — más confiable cuando hubo borrados intermedios.
+            periodos_por_clave = {}
+            if "Periodo" in df_ed.columns:
+                for _, _r in df_ed.iterrows():
+                    _clave = (str(_r["Concepto"]).strip(), str(_r["Fecha"]), round(float(_r["Monto"]), 2))
+                    periodos_por_clave[_clave] = _r["Periodo"]
+            _periodos_nuevas = []
+            for _, _r in nuevas.iterrows():
+                _clave = (str(_r["Concepto"]).strip(), str(_r["Fecha"]), round(float(_r["Monto"]), 2))
+                _periodos_nuevas.append(periodos_por_clave.get(_clave, periodo_de_esta_vista))
+            nuevas["Periodo"] = _periodos_nuevas
 
             for col in FILES["gastos"][1]:
                 if col not in nuevas.columns:
@@ -1994,7 +2014,6 @@ with tabs[2]:
             # hay que recalcular df_ed desde cero (no reusar la copia vieja).
             st.session_state.pop(_key_periodo, None)
             st.session_state.pop(_key_rowids, None)
-            st.session_state.pop(_editor_key, None)
             if cambios_detectados:
                 st.success(f"✅ Guardado. {len(nuevas)} filas actualizadas. {len(cambios_detectados)} cambio(s) registrado(s) en el historial.")
             else:
