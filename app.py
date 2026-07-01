@@ -635,19 +635,27 @@ def ciclo_por_offset_de_tarjeta(tarjeta_nombre, tarjetas_df, offset):
     return ultimo
 
 def filtrar_gastos_tarjeta_rango(gastos_df, tarjeta_nombre, inicio, fin):
-    """Filtra gastos por FECHA del movimiento dentro del rango [inicio, fin].
-    Ignora la columna Periodo — la Fecha de compra determina en qué ciclo
-    aparece el gasto, igual que en el resumen real del banco."""
+    """Filtra gastos cuyo Periodo es exactamente igual a fin (fecha de cierre
+    del ciclo). Esto replica exactamente el resumen bancario: el banco agrupa
+    todos los gastos de un resumen por su fecha de cierre, sin importar
+    cuándo fue la compra original."""
     if gastos_df.empty:
         return gastos_df.copy()
     mask_tarjeta = gastos_df["Tarjeta"].astype(str).str.strip() == tarjeta_nombre.strip()
-    fechas_dt = pd.to_datetime(gastos_df["Fecha"], errors="coerce")
-    fechas = fechas_dt.apply(lambda x: x.date() if pd.notna(x) else None)
-    mask_valida = fechas.notna()
-    mask_rango = pd.Series(False, index=gastos_df.index)
-    if mask_valida.any():
-        mask_rango.loc[mask_valida] = fechas[mask_valida].apply(lambda d: inicio <= d <= fin)
-    return gastos_df[mask_tarjeta & mask_rango].copy()
+    if "Periodo" not in gastos_df.columns:
+        # Compatibilidad: sin Periodo, filtrar por Fecha
+        fechas_dt = pd.to_datetime(gastos_df["Fecha"], errors="coerce")
+        fechas = fechas_dt.apply(lambda x: x.date() if pd.notna(x) else None)
+        mask_valida = fechas.notna()
+        mask_rango = pd.Series(False, index=gastos_df.index)
+        if mask_valida.any():
+            mask_rango.loc[mask_valida] = fechas[mask_valida].apply(lambda d: inicio <= d <= fin)
+        return gastos_df[mask_tarjeta & mask_rango].copy()
+    # Con Periodo: matchear exactamente la fecha de cierre del ciclo
+    periodo_dt = pd.to_datetime(gastos_df["Periodo"], errors="coerce")
+    periodo_date = periodo_dt.apply(lambda x: x.date() if pd.notna(x) else None)
+    mask_periodo = periodo_date.apply(lambda d: d == fin if d is not None else False)
+    return gastos_df[mask_tarjeta & mask_periodo].copy()
 
 # ── Estimación de cuotas futuras (NO oficial, ver aclaración en UI) ────────────
 def estimar_cuotas_en_periodo_futuro(gastos_df, tarjeta_nombre, fin_periodo):
