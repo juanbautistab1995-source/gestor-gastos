@@ -1845,15 +1845,10 @@ with tabs[2]:
         # reconstruye desde gastos_df hasta que se guarda explícitamente o
         # se cambia de período/tarjeta.
         _key_periodo = f"_df_ed_state_{t_sel}_{inicio_p}_{fin_p}"
-        _key_rowids = f"_row_ids_state_{t_sel}_{inicio_p}_{fin_p}"
 
         if _key_periodo not in st.session_state:
-            gastos_con_id = gastos_df.reset_index(drop=True).copy()
-            gastos_con_id["_row_id"] = range(len(gastos_con_id))
-            df_per_con_id = filtrar_gastos_tarjeta_rango(gastos_con_id, t_sel, inicio_p, fin_p)
-            row_ids_periodo = list(df_per_con_id["_row_id"].astype(int))
-
-            df_ed = df_per_con_id.drop(columns=["_row_id"], errors="ignore").copy().reset_index(drop=True)
+            df_per = filtrar_gastos_tarjeta_rango(gastos_df, t_sel, inicio_p, fin_p)
+            df_ed = df_per.copy().reset_index(drop=True)
             df_ed["Fecha"]    = df_ed["Fecha"].apply(lambda x: pd.to_datetime(x, errors="coerce").date() if str(x) not in ("S/F","","nan") else None)
             df_ed["Monto"]    = pd.to_numeric(df_ed["Monto"], errors="coerce").fillna(0)
             _cuotas_parseadas = df_ed["Cuotas"].apply(parsear_cuotas)
@@ -1861,22 +1856,19 @@ with tabs[2]:
             df_ed["Cuota total"]  = _cuotas_parseadas.apply(lambda t: t[1])
             df_ed = df_ed.drop(columns=["Cuotas"])
             df_ed["Cuanto recupero"] = pd.to_numeric(df_ed["Cuanto recupero"], errors="coerce").fillna(0)
-            df_ed["Periodo"] = df_per_con_id["Periodo"].values if "Periodo" in df_per_con_id.columns else df_ed["Fecha"]
+            df_ed["Periodo"] = df_per["Periodo"].values if "Periodo" in df_per.columns else df_ed["Fecha"]
             for c in ["Concepto","Tarjeta","Categoria","Compartido","Con quien","Notas"]:
                 df_ed[c] = df_ed[c].fillna("").astype(str)
-
             st.session_state[_key_periodo] = df_ed
-            st.session_state[_key_rowids] = row_ids_periodo
         else:
             df_ed = st.session_state[_key_periodo]
-            row_ids_periodo = st.session_state[_key_rowids]
 
         # Limpiar estados de OTROS períodos/tarjetas para no acumular
         # session_state indefinidamente a medida que el usuario navega.
         for _k in list(st.session_state.keys()):
             if _k.startswith("_df_ed_state_") and _k != _key_periodo:
                 del st.session_state[_k]
-            if _k.startswith("_row_ids_state_") and _k != _key_rowids:
+            if _k.startswith("_row_ids_state_"):
                 del st.session_state[_k]
 
         # FIX PROBLEMA 1: "Con quien" se edita DIRECTO en esta misma tabla —
@@ -1938,15 +1930,24 @@ with tabs[2]:
             base = load("gastos")
             base["Monto"]           = to_num(base["Monto"])
             base["Cuanto recupero"] = to_num(base["Cuanto recupero"])
-            base["_row_id"]         = range(len(base))
 
-            max_id = len(base) - 1
-            ids_validos = {i for i in row_ids_periodo if 0 <= i <= max_id}
-            if not ids_validos and row_ids_periodo:
-                st.error("Error de sincronización. Recargá la página y volvé a intentar.")
-                st.stop()
-
-            base_limpia = base[~base["_row_id"].isin(ids_validos)].drop(columns=["_row_id"]).reset_index(drop=True)
+            # NUEVO MECANISMO: en vez de rastrear row_ids numéricos (que se
+            # desincronizaban cuando base cambiaba de tamaño entre la primera
+            # carga y el guardado), identificamos las filas del período por
+            # CLAVE DE CONTENIDO: Concepto+Fecha+Tarjeta+Periodo.
+            # Esto es robusto porque no depende de posiciones en el DataFrame.
+            def _clave_fila(r):
+                return (
+                    str(r.get("Concepto","")).strip(),
+                    str(r.get("Fecha",""))[:10],
+                    str(r.get("Tarjeta","")).strip(),
+                    str(r.get("Periodo",""))[:10],
+                )
+            # Las claves que pertenecen a este período son las de df_ed
+            # (la copia estable que cargamos al inicio de esta vista).
+            claves_periodo = set(df_ed.apply(_clave_fila, axis=1))
+            mascara_borrar = base.apply(_clave_fila, axis=1).isin(claves_periodo)
+            base_limpia = base[~mascara_borrar].reset_index(drop=True)
 
             nuevas = edited_per.copy()
             nuevas["Fecha"]           = nuevas["Fecha"].apply(fmt_fecha)
@@ -2013,7 +2014,6 @@ with tabs[2]:
             # cambiaron, así que la próxima vez que se entre a este período
             # hay que recalcular df_ed desde cero (no reusar la copia vieja).
             st.session_state.pop(_key_periodo, None)
-            st.session_state.pop(_key_rowids, None)
             if cambios_detectados:
                 st.success(f"✅ Guardado. {len(nuevas)} filas actualizadas. {len(cambios_detectados)} cambio(s) registrado(s) en el historial.")
             else:
