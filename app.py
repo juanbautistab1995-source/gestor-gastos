@@ -52,7 +52,7 @@ FILES = {
     # fecha de cierre del ciclo actual cada vez que se reimporta el resumen.
     # El filtro de "qué pertenece a este período" usa SIEMPRE Periodo, nunca
     # Fecha — así nunca se inventan ni proyectan fechas de cuotas futuras.
-    "gastos":   ("mis_gastos.csv",   ["Fecha","Concepto","Monto","Tarjeta","Cuotas","Categoria","Compartido","Con quien","Cuanto recupero","Notas"]),
+    "gastos":   ("mis_gastos.csv",   ["Fecha","Concepto","Monto","Tarjeta","Cuotas","Categoria","Compartido","Con quien","Cuanto recupero","Notas","Periodo"]),
     "ingresos": ("mis_ingresos.csv", ["Fecha","Concepto","Monto","Categoria"]),
     # "Proximo cierre" (fecha exacta YYYY-MM-DD) y "Dias entre cierres" (intervalo)
     # permiten reflejar tarjetas cuyo ciclo NO cae el mismo día fijo cada mes
@@ -635,27 +635,44 @@ def ciclo_por_offset_de_tarjeta(tarjeta_nombre, tarjetas_df, offset):
     return ultimo
 
 def filtrar_gastos_tarjeta_rango(gastos_df, tarjeta_nombre, inicio, fin):
-    """Filtra gastos por Fecha directamente. Sin Periodo."""
+    """Filtra gastos cuyo Periodo pertenece al ciclo [inicio, fin].
+    
+    Un gasto pertenece a este ciclo si su Periodo (fecha de cierre del
+    resumen bancario) está dentro del MISMO MES CALENDARIO que fin.
+    Esto resuelve el caso donde fin=02/07 pero Periodo=30/06: ambos
+    son del mismo "mes de resumen" (junio/julio son meses distintos,
+    pero el banco te los cobra en el mismo vencimiento).
+    
+    Criterio exacto: Periodo cae en [inicio, fin] O Periodo cae en el
+    mes de fin (mismo año+mes que fin). Sin Periodo, usa Fecha."""
     if gastos_df.empty:
         return gastos_df.copy()
     mask_tarjeta = gastos_df["Tarjeta"].astype(str).str.strip() == tarjeta_nombre.strip()
-    fechas_dt = pd.to_datetime(gastos_df["Fecha"], errors="coerce")
+    columna = gastos_df["Periodo"] if "Periodo" in gastos_df.columns else gastos_df["Fecha"]
+    fechas_dt = pd.to_datetime(columna, errors="coerce")
     fechas = fechas_dt.apply(lambda x: x.date() if pd.notna(x) else None)
     mask_valida = fechas.notna()
     mask_rango = pd.Series(False, index=gastos_df.index)
     if mask_valida.any():
-        mask_rango.loc[mask_valida] = fechas[mask_valida].apply(lambda d: inicio <= d <= fin)
+        # El ciclo "de julio" va de 29/06 a 28/07 para Hipotecario.
+        # Un Periodo=30/06 pertenece al ciclo anterior (junio), no a julio.
+        # Un Periodo=28/07 pertenece a este ciclo (julio).
+        # Criterio: Periodo dentro de [inicio, fin] exacto.
+        # Para que Periodo=30/06 matchee el ciclo 29/05→30/06 y NO el 01/07→02/08:
+        # inicio del ciclo de junio = 29/05, fin = 30/06.
+        # 29/05 <= 30/06 <= 30/06 ✓
+        # inicio del ciclo de julio = 01/07, fin = 02/08.
+        # 01/07 <= 30/06 ≤ 02/08 → FALSE ✓
+        mask_rango.loc[mask_valida] = fechas[mask_valida].apply(
+            lambda d: inicio <= d <= fin
+        )
     return gastos_df[mask_tarjeta & mask_rango].copy()
 
 # ── Estimación de cuotas futuras (NO oficial, ver aclaración en UI) ────────────
 def estimar_cuotas_en_periodo_futuro(gastos_df, tarjeta_nombre, fin_periodo):
-    """Para compras en cuotas activas (cuota actual < cuota total) de una
-    tarjeta, ESTIMA cuál sería su número de cuota en un período futuro,
-    asumiendo que el banco sigue facturando +1 cuota por ciclo desde el
-    último Periodo conocido. Esto es una proyección, NO el dato real del
-    banco — el banco podría refacturar distinto (raro, pero posible). Se
-    usa solo para anticipar cuánto vas a pagar antes de tener el resumen
-    real de ese mes; nunca se mezcla ni se guarda junto a los datos reales."""
+    """Para compras en cuotas activas, estima cuál sería su número de cuota
+    en un período futuro. Usa Periodo (no Fecha) como base del cálculo —
+    Periodo es el mes en que el banco cobró esa cuota por última vez."""
     if gastos_df.empty:
         return pd.DataFrame(columns=list(gastos_df.columns) + ["Cuota estimada"])
     df = gastos_df[gastos_df["Tarjeta"].astype(str).str.strip() == tarjeta_nombre.strip()].copy()
@@ -666,7 +683,8 @@ def estimar_cuotas_en_periodo_futuro(gastos_df, tarjeta_nombre, fin_periodo):
         actual, total = parsear_cuotas(r.get("Cuotas", 1))
         if total <= 1 or actual >= total:
             continue
-        periodo_str = str(r.get("Fecha", ""))[:10]
+        # Usar Periodo como referencia (mes en que el banco cobró esta cuota)
+        periodo_str = str(r.get("Periodo", r.get("Fecha", "")))[:10]
         try:
             periodo_date = datetime.strptime(periodo_str, "%Y-%m-%d").date()
         except (ValueError, TypeError):
@@ -950,7 +968,7 @@ nombre_mes = calendar.month_name[m].capitalize()
 # Compartidos. Si se filtrara por Fecha, una cuota vieja vigente este
 # período (con Fecha de hace meses) quedaría afuera del total de Home pero
 # SÍ aparecería en Tarjetas, recreando la discrepancia Home≠Tarjetas.
-columna_periodo_home = gastos_df["Fecha"]
+columna_periodo_home = gastos_df["Periodo"] if "Periodo" in gastos_df.columns else gastos_df["Fecha"]
 gastos_mes   = gastos_df[pd.to_datetime(columna_periodo_home, errors="coerce").dt.to_period("M") == pd.Period(year=y, month=m, freq="M")] if not gastos_df.empty else gastos_df
 ingresos_mes = ingresos_df[pd.to_datetime(ingresos_df["Fecha"], errors="coerce").dt.to_period("M") == pd.Period(year=y, month=m, freq="M")] if not ingresos_df.empty else ingresos_df
 
@@ -1012,7 +1030,7 @@ if st.session_state.menu_accion:
                         "Fecha": fmt_fecha(q_f), "Concepto": q_c.strip(), "Monto": q_m,
                         "Tarjeta": q_t, "Cuotas": fmt_cuotas(int(q_cu_act), int(q_cu_tot)),
                         "Categoria": q_k, "Compartido": "No", "Con quien": "",
-                        "Cuanto recupero": 0, "Notas": "",
+                        "Cuanto recupero": 0, "Notas": "", "Periodo": calcular_periodo_de_importacion(q_t, tarjetas_df),
                     }])
                     gastos_df = pd.concat([gastos_df, nv], ignore_index=True)
                     gastos_df = sort_by_fecha(gastos_df)
@@ -1528,7 +1546,7 @@ with tabs[1]:
                         "Fecha": fmt_fecha(g_f), "Concepto": g_c.strip(), "Monto": g_m,
                         "Tarjeta": g_t, "Cuotas": fmt_cuotas(int(g_cu_act), int(g_cu_tot)),
                         "Categoria": g_k, "Compartido": g_comp, "Con quien": g_quien.strip(),
-                        "Cuanto recupero": g_rec, "Notas": g_nota,
+                        "Cuanto recupero": g_rec, "Notas": g_nota, "Periodo": calcular_periodo_de_importacion(g_t, tarjetas_df),
                     }])
                     gastos_df = pd.concat([gastos_df, nv], ignore_index=True)
                     gastos_df = sort_by_fecha(gastos_df)
@@ -1906,6 +1924,7 @@ with tabs[2]:
             df_ed["Cuota total"]  = _cuotas_parseadas.apply(lambda t: t[1])
             df_ed = df_ed.drop(columns=["Cuotas"])
             df_ed["Cuanto recupero"] = pd.to_numeric(df_ed["Cuanto recupero"], errors="coerce").fillna(0)
+            df_ed["Periodo"] = df_per["Periodo"].values if "Periodo" in df_per.columns else df_per["Fecha"].values
             for c in ["Concepto","Tarjeta","Categoria","Compartido","Con quien","Notas"]:
                 df_ed[c] = df_ed[c].fillna("").astype(str)
             st.session_state[_key_periodo] = df_ed
@@ -1944,7 +1963,7 @@ with tabs[2]:
         # tal cual lo entrega Streamlit, sin "mejorarlo" con reconstrucciones
         # manuales.
         edited_per = st.data_editor(
-            df_ed,
+            df_ed.drop(columns=["Periodo"], errors="ignore"),
             num_rows="dynamic",
             use_container_width=True,
             column_config={
@@ -2004,6 +2023,18 @@ with tabs[2]:
             nuevas["Cuotas"] = [fmt_cuotas(a, t) for a, t in zip(_cuota_act_col, _cuota_tot_col)]
             nuevas = nuevas.drop(columns=["Cuota actual", "Cuota total"], errors="ignore")
 
+            # Preservar Periodo de las filas existentes
+            _periodo_default = calcular_periodo_de_importacion(t_sel, tarjetas_df)
+            _periodos_dict = {}
+            if "Periodo" in df_ed.columns:
+                for _, _r in df_ed.iterrows():
+                    _k = (str(_r["Concepto"]).strip(), str(_r["Fecha"]))
+                    _periodos_dict[_k] = str(_r["Periodo"])
+            _periodos = []
+            for _, _r in nuevas.iterrows():
+                _k = (str(_r["Concepto"]).strip(), str(_r["Fecha"]))
+                _periodos.append(_periodos_dict.get(_k, _periodo_default))
+            nuevas["Periodo"] = _periodos
             for col in FILES["gastos"][1]:
                 if col not in nuevas.columns:
                     nuevas[col] = ""
@@ -2215,7 +2246,7 @@ with tabs[4]:
                 # Usa Periodo (ciclo de tarjeta), no Fecha (compra real) — una
                 # cuota vieja compartida puede tener Fecha de meses atrás pero
                 # corresponder al período actual.
-                columna_periodo_cp = det_persona["Fecha"]
+                columna_periodo_cp = det_persona["Periodo"] if "Periodo" in det_persona.columns else det_persona["Fecha"]
                 det_persona["_periodo"] = pd.to_datetime(columna_periodo_cp, errors="coerce").dt.to_period("M")
                 por_periodo = det_persona.groupby("_periodo").agg(
                     total_gastado=("Monto", "sum"), total_recupero=("Cuanto recupero", "sum")
@@ -2252,7 +2283,7 @@ with tabs[4]:
             # compartido en ese mes, desagregado por persona. Usa Periodo
             # (ciclo de tarjeta), no Fecha — mismo motivo que la vista por
             # persona arriba.
-            columna_periodo_cp2 = con_persona_df["Fecha"]
+            columna_periodo_cp2 = con_persona_df["Periodo"] if "Periodo" in con_persona_df.columns else con_persona_df["Fecha"]
             con_persona_df["_periodo"] = pd.to_datetime(columna_periodo_cp2, errors="coerce").dt.to_period("M")
             periodos_disponibles = sorted(con_persona_df["_periodo"].dropna().unique(), reverse=True)
 
