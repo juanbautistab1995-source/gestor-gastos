@@ -608,6 +608,22 @@ def ciclo_actual_de_tarjeta(tarjeta_nombre, tarjetas_df):
         return min(posteriores)
     return max(ciclos) if ciclos else (date(hoy.year, hoy.month, 1), date(hoy.year, hoy.month, calendar.monthrange(hoy.year, hoy.month)[1]))
 
+def nombre_mes_de_ciclo(fin_ciclo):
+    """Devuelve (nombre_mes, año) para el label de un ciclo, según su fecha
+    de cierre. Un cierre a comienzos de mes (día <= 10) corresponde al
+    resumen del MES ANTERIOR — ej: un cierre el 02/07 es el resumen de junio,
+    no de julio. Esto refleja cómo el usuario piensa sus resúmenes: el
+    resumen 'de junio' puede cerrar los primeros días de julio."""
+    mes = fin_ciclo.month
+    año = fin_ciclo.year
+    if fin_ciclo.day <= 10:
+        # Cierre a comienzos de mes → pertenece al mes anterior
+        mes -= 1
+        if mes == 0:
+            mes = 12
+            año -= 1
+    return calendar.month_name[mes].capitalize(), año
+
 def ciclo_por_offset_de_tarjeta(tarjeta_nombre, tarjetas_df, offset):
     """Devuelve el ciclo de la tarjeta `offset` posiciones relativas al
     ciclo actual (offset=0 -> actual, -1 -> anterior, +1 -> siguiente).
@@ -1110,7 +1126,8 @@ with tabs[0]:
         # abajo), así que mostrar solo "Julio 2026" sin indicar de qué
         # tarjeta sugería falsamente que todo el desglose era de ese mismo
         # mes para todas.
-        _label_periodo_home = f"{calendar.month_name[_fin_home_sel.month].capitalize()} {_fin_home_sel.year}"
+        _mes_label, _año_label = nombre_mes_de_ciclo(_fin_home_sel)
+        _label_periodo_home = f"{_mes_label} {_año_label}"
         if st.session_state["_home_offset"] == 0:
             _label_periodo_home += " · actual"
         st.markdown(
@@ -1828,7 +1845,10 @@ with tabs[2]:
             idx_actual = i
             break
 
-    opciones_ciclo = [f"{ini_c.strftime('%d/%m')} → {fin_c.strftime('%d/%m/%y')}  (cierra {calendar.month_name[fin_c.month][:3]} {fin_c.year})"
+    def _fmt_opcion_ciclo(ini_c, fin_c):
+        _m, _a = nombre_mes_de_ciclo(fin_c)
+        return f"{ini_c.strftime('%d/%m')} → {fin_c.strftime('%d/%m/%y')}  (resumen {_m[:3]} {_a})"
+    opciones_ciclo = [_fmt_opcion_ciclo(ini_c, fin_c)
                        for ini_c, fin_c in ciclos_disponibles]
     idx_sel = st.selectbox("Período (ciclo real de cierre)", range(len(opciones_ciclo)),
                             format_func=lambda i: opciones_ciclo[i], index=idx_actual, key="ciclo_sel_tab")
