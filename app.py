@@ -624,6 +624,23 @@ def nombre_mes_de_ciclo(fin_ciclo):
             año -= 1
     return calendar.month_name[mes].capitalize(), año
 
+def ciclo_de_tarjeta_para_mes(tarjeta_nombre, tarjetas_df, mes, año):
+    """Devuelve el ciclo (inicio, fin) de la tarjeta cuyo RESUMEN corresponde
+    al mes/año dado. El resumen de un ciclo es el mes de su fecha de cierre,
+    ajustado: si cierra en los primeros 10 días del mes, pertenece al mes
+    anterior (ver nombre_mes_de_ciclo). Esto permite que Home agrupe las
+    tarjetas por 'mes de resumen' aunque cada una cierre en fechas distintas.
+    Devuelve None si la tarjeta no tiene un ciclo para ese mes."""
+    tarjetas_csv = tarjetas_df.to_csv(index=False) if not tarjetas_df.empty else ""
+    ciclos = listar_ciclos_tarjeta(tarjeta_nombre, tarjetas_csv, n_pasados=24, n_futuros=24)
+    for ini, fin in ciclos:
+        m_nombre, a = nombre_mes_de_ciclo(fin)
+        # Convertir nombre de mes a número
+        m_num = list(calendar.month_name).index(m_nombre) if m_nombre in calendar.month_name else None
+        if m_num == mes and a == año:
+            return (ini, fin)
+    return None
+
 def ciclo_por_offset_de_tarjeta(tarjeta_nombre, tarjetas_df, offset):
     """Devuelve el ciclo de la tarjeta `offset` posiciones relativas al
     ciclo actual (offset=0 -> actual, -1 -> anterior, +1 -> siguiente).
@@ -1105,57 +1122,79 @@ tabs = st.tabs(["Inicio","Gastos","Tarjetas","Ingresos","Compartidos"])
 # TAB 0 — INICIO (rediseño: selector de período + 4 métricas + resúmenes)
 # ══════════════════════════════════════════════════════════════════════════════
 with tabs[0]:
-    # Selector de período: navega por offset relativo al ciclo ACTUAL de la
-    # tarjeta principal (offset=0). Cada tarjeta calcula su propio ciclo
-    # para ese mismo offset (ciclo_por_offset_de_tarjeta), así que aunque
-    # cierren en días distintos, "un mes atrás" significa lo mismo para
-    # todas a la vez — a pedido explícito (selector de período en Home).
-    if "_home_offset" not in st.session_state:
-        st.session_state["_home_offset"] = 0
+    # Navegación por MES DE RESUMEN (no por offset relativo). Cada tarjeta
+    # puede cerrar en días distintos, pero todas comparten el concepto de
+    # "resumen de junio", "resumen de julio", etc. Para el mes seleccionado,
+    # cada tarjeta muestra el ciclo cuyo resumen pertenece a ese mes.
+    # Esto resuelve el descalce donde Visa ICBC (cierra 25/06) quedaba en
+    # "julio" mientras Master (cierra 02/07) quedaba en "junio" en el mismo
+    # offset — ahora ambas se agrupan por el mes de resumen real.
     _tarjeta_principal_home = get_tarjeta_principal(gastos_df, tarjetas_df)
+    _hoy_home = date.today()
+    # Mes de resumen actual = el del ciclo actual de la tarjeta principal
+    _ini_actual_pp, _fin_actual_pp = ciclo_actual_de_tarjeta(_tarjeta_principal_home, tarjetas_df)
+    _mes_actual_nombre, _año_actual = nombre_mes_de_ciclo(_fin_actual_pp)
+    _mes_actual_num = list(calendar.month_name).index(_mes_actual_nombre)
+
+    if "_home_mes" not in st.session_state:
+        st.session_state["_home_mes"] = _mes_actual_num
+        st.session_state["_home_año"] = _año_actual
+
     c_prev, c_label, c_next = st.columns([1, 3, 1])
     with c_prev:
         if st.button("◀", key="home_periodo_prev"):
-            st.session_state["_home_offset"] -= 1
+            m = st.session_state["_home_mes"] - 1
+            a = st.session_state["_home_año"]
+            if m == 0:
+                m = 12; a -= 1
+            st.session_state["_home_mes"] = m
+            st.session_state["_home_año"] = a
             st.rerun()
-    _ini_home_sel, _fin_home_sel = ciclo_por_offset_de_tarjeta(_tarjeta_principal_home, tarjetas_df, st.session_state["_home_offset"])
+    with c_next:
+        if st.button("▶", key="home_periodo_next"):
+            m = st.session_state["_home_mes"] + 1
+            a = st.session_state["_home_año"]
+            if m == 13:
+                m = 1; a += 1
+            st.session_state["_home_mes"] = m
+            st.session_state["_home_año"] = a
+            st.rerun()
+
+    _mes_sel = st.session_state["_home_mes"]
+    _año_sel = st.session_state["_home_año"]
     with c_label:
-        # Aclarar que este mes corresponde al ciclo de la tarjeta PRINCIPAL
-        # (la más usada) — cada tarjeta puede estar en un rango de fechas
-        # distinto al mismo tiempo (a propósito, ver detalle por tarjeta más
-        # abajo), así que mostrar solo "Julio 2026" sin indicar de qué
-        # tarjeta sugería falsamente que todo el desglose era de ese mismo
-        # mes para todas.
-        _mes_label, _año_label = nombre_mes_de_ciclo(_fin_home_sel)
-        _label_periodo_home = f"{_mes_label} {_año_label}"
-        if st.session_state["_home_offset"] == 0:
+        _label_periodo_home = f"{calendar.month_name[_mes_sel].capitalize()} {_año_sel}"
+        if _mes_sel == _mes_actual_num and _año_sel == _año_actual:
             _label_periodo_home += " · actual"
         st.markdown(
             f"<div style='text-align:center;font-size:0.78rem;color:#888;padding-top:0.4rem'>{_label_periodo_home}</div>"
-            f"<div style='text-align:center;font-size:0.62rem;color:#555'>según {_tarjeta_principal_home} · cada tarjeta puede variar</div>",
+            f"<div style='text-align:center;font-size:0.62rem;color:#555'>resumen del mes · todas las tarjetas</div>",
             unsafe_allow_html=True
         )
-    with c_next:
-        if st.button("▶", key="home_periodo_next"):
-            st.session_state["_home_offset"] += 1
-            st.rerun()
 
-    # Recalcular las 4 métricas para el período seleccionado (no siempre el
-    # actual — el usuario puede navegar). Cada tarjeta usa SU propio ciclo
-    # para ese mismo offset.
+    # Para el mes seleccionado, cada tarjeta usa el ciclo cuyo resumen
+    # corresponde a ese mes. Si una tarjeta no tiene ciclo para ese mes, se
+    # omite (no aporta gastos).
+    _ciclos_mes = {}
     _gastos_periodo_home = []
     for _tname in TARJETAS:
-        _ini_t, _fin_t = ciclo_por_offset_de_tarjeta(_tname, tarjetas_df, st.session_state["_home_offset"])
+        _ciclo = ciclo_de_tarjeta_para_mes(_tname, tarjetas_df, _mes_sel, _año_sel)
+        if _ciclo is None:
+            continue
+        _ini_t, _fin_t = _ciclo
+        _ciclos_mes[_tname] = _ciclo
         _gf = filtrar_gastos_tarjeta_rango(gastos_df, _tname, _ini_t, _fin_t)
         if not _gf.empty:
             _gastos_periodo_home.append(_gf)
     gastos_periodo_home = pd.concat(_gastos_periodo_home, ignore_index=True) if _gastos_periodo_home else gastos_df.iloc[0:0]
 
-    _ini_principal, _fin_principal = ciclo_por_offset_de_tarjeta(_tarjeta_principal_home, tarjetas_df, st.session_state["_home_offset"])
-    # FIX: mismo blindaje que filtrar_gastos_tarjeta_rango — evitar comparar
-    # un dtype datetime64 (cuando toda la columna es NaT) contra un date()
-    # de Python, que en pandas reciente lanza TypeError en vez de devolver
-    # False para cada fila.
+    # Ingresos del período: usar el ciclo de la tarjeta principal para ese mes
+    _ciclo_pp_mes = ciclo_de_tarjeta_para_mes(_tarjeta_principal_home, tarjetas_df, _mes_sel, _año_sel)
+    if _ciclo_pp_mes is not None:
+        _ini_principal, _fin_principal = _ciclo_pp_mes
+    else:
+        _ini_principal = date(_año_sel, _mes_sel, 1)
+        _fin_principal = date(_año_sel, _mes_sel, calendar.monthrange(_año_sel, _mes_sel)[1])
     if not ingresos_df.empty:
         _fechas_ing = pd.to_datetime(ingresos_df["Fecha"], errors="coerce").apply(lambda x: x.date() if pd.notna(x) else None)
         _mask_ing_valida = _fechas_ing.notna()
@@ -1199,7 +1238,9 @@ with tabs[0]:
     tarjetas_con_gasto = {}
     rango_por_tarjeta = {}
     for _tname in TARJETAS:
-        _ini_t, _fin_t = ciclo_por_offset_de_tarjeta(_tname, tarjetas_df, st.session_state["_home_offset"])
+        if _tname not in _ciclos_mes:
+            continue
+        _ini_t, _fin_t = _ciclos_mes[_tname]
         _gf_t = gastos_periodo_home[gastos_periodo_home["Tarjeta"].astype(str).str.strip() == _tname.strip()] if not gastos_periodo_home.empty else gastos_periodo_home
         _total_t = _gf_t["Monto"].sum() if not _gf_t.empty else 0
         if _total_t > 0:
