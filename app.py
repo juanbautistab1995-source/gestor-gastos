@@ -321,10 +321,52 @@ def fmt_cuotas(actual, total):
 # resumen de un mes, si una fila ya existe (mismo Concepto+Fecha+Tarjeta),
 # se actualiza su Cuotas y su Periodo (avanza al período actual); si no
 # existe, se crea nueva con Periodo = Fecha de hoy (cuota 1, alta real).
+def periodo_para_fila(fecha_compra_str, cuotas_str, tarjeta_nombre, tarjetas_df):
+    """Calcula el Periodo correcto para una fila según la lógica del banco:
+    - Si es cuota 1/N o gasto de 1 cuota: el Periodo es la fecha de cierre
+      del ciclo al que pertenece la FECHA DE COMPRA (el banco la factura en
+      el próximo resumen posterior a la fecha de compra).
+    - Si es cuota X/N con X > 1: el banco ya la está facturando en el ciclo
+      actual, así que el Periodo es el cierre del ciclo actual de la tarjeta.
+    Esta lógica replica exactamente cómo el banco argentino asigna cada
+    compra/cuota a un resumen."""
+    from datetime import date as _date
+    
+    # Parsear cuota
+    _cuota_act, _cuota_tot = parsear_cuotas(cuotas_str)
+    es_cuota_posterior = _cuota_act > 1  # cuota 2/12, 3/6, etc.
+    
+    if es_cuota_posterior:
+        # Para cuotas intermedias: el ciclo actual del banco es el que factura
+        _, fin = ciclo_actual_de_tarjeta(tarjeta_nombre, tarjetas_df)
+        return fin.strftime("%Y-%m-%d")
+    
+    # Para cuota 1/N o gasto simple: usar fecha de compra para determinar ciclo
+    try:
+        fecha_compra = pd.to_datetime(fecha_compra_str, errors="coerce")
+        if pd.isna(fecha_compra):
+            _, fin = ciclo_actual_de_tarjeta(tarjeta_nombre, tarjetas_df)
+            return fin.strftime("%Y-%m-%d")
+        fecha_compra = fecha_compra.date()
+    except Exception:
+        _, fin = ciclo_actual_de_tarjeta(tarjeta_nombre, tarjetas_df)
+        return fin.strftime("%Y-%m-%d")
+    
+    # Obtener los cierres de la tarjeta y encontrar el cierre inmediatamente
+    # posterior a la fecha de compra (el banco factura en ese resumen)
+    tarjetas_csv = tarjetas_df.to_csv(index=False) if not tarjetas_df.empty else ""
+    ciclos = sorted(listar_ciclos_tarjeta(tarjeta_nombre, tarjetas_csv, n_pasados=24, n_futuros=12))
+    for ini, fin in ciclos:
+        if ini <= fecha_compra <= fin:
+            return fin.strftime("%Y-%m-%d")
+    
+    # Fallback: ciclo actual
+    _, fin = ciclo_actual_de_tarjeta(tarjeta_nombre, tarjetas_df)
+    return fin.strftime("%Y-%m-%d")
+
 def calcular_periodo_de_importacion(tarjeta_nombre, tarjetas_df):
-    """Devuelve la fecha de FIN del ciclo actual de la tarjeta — el valor
-    que se usa como Periodo para todas las filas de una importación, ya
-    que todas las filas de un mismo resumen pertenecen al mismo ciclo."""
+    """Devuelve la fecha de FIN del ciclo actual de la tarjeta.
+    Usado como fallback cuando no tenemos fecha de compra disponible."""
     _, fin = ciclo_actual_de_tarjeta(tarjeta_nombre, tarjetas_df)
     return fin.strftime("%Y-%m-%d")
 
@@ -606,29 +648,31 @@ def ciclo_por_offset_de_tarjeta(tarjeta_nombre, tarjetas_df, offset):
     return ultimo
 
 def filtrar_gastos_tarjeta_rango(gastos_df, tarjeta_nombre, inicio, fin):
-    """Filtra gastos de una tarjeta cuyo PERIODO (no Fecha) cae dentro de
-    [inicio, fin]. Usa Periodo, no Fecha, porque Fecha es la fecha real de
-    compra (que para una cuota vieja puede ser de meses atrás) mientras que
-    Periodo es el ciclo de tarjeta al que esa fila pertenece ahora — ver
-    el bloque de comentarios sobre el modelo de cuotas más arriba en el
-    archivo para el porqué de esta distinción."""
+    """Filtra gastos de una tarjeta cuyo PERIODO corresponde al ciclo dado.
+    El campo Periodo siempre es la FECHA DE CIERRE del resumen al que
+    pertenece la fila (ej: 2026-06-30 para el resumen que cierra el 30/06).
+    Por eso el filtro correcto es Periodo == fin (fecha de cierre del ciclo),
+    NO inicio <= Periodo <= fin — con ese último criterio, una fecha como
+    2026-06-30 quedaría fuera del ciclo siguiente 01/07→02/08, aunque
+    conceptualmente sí pertenece al resumen de ese cierre.
+    También acepta gastos cuyo Periodo caiga dentro del rango [inicio, fin]
+    para compatibilidad con datos migrados con Periodo=Fecha (que puede ser
+    cualquier fecha de compra dentro del ciclo)."""
     if gastos_df.empty:
         return gastos_df.copy()
     mask_tarjeta = gastos_df["Tarjeta"].astype(str).str.strip() == tarjeta_nombre.strip()
     columna_periodo = gastos_df["Periodo"] if "Periodo" in gastos_df.columns else gastos_df["Fecha"]
     fechas_dt = pd.to_datetime(columna_periodo, errors="coerce")
-    # FIX: en pandas reciente, cuando TODA la columna falla el parseo (todo
-    # NaT), ".dt.date" no convierte a un array de objetos date de Python —
-    # se queda en dtype datetime64, y comparar ese dtype contra un date()
-    # de Python con >=/<= lanza TypeError ("Invalid comparison between
-    # dtype=datetime64[s] and date"). Forzar a object/date explícitamente
-    # evita el problema en cualquier versión de pandas, sin importar si hay
-    # 0, algunas, o todas las fechas válidas.
+    # FIX pandas reciente: .dt.date puede no convertir si todo es NaT
     fechas = fechas_dt.apply(lambda x: x.date() if pd.notna(x) else None)
     mask_valida = fechas.notna()
     mask_rango = pd.Series(False, index=gastos_df.index)
     if mask_valida.any():
-        mask_rango.loc[mask_valida] = fechas[mask_valida].apply(lambda d: inicio <= d <= fin)
+        # Incluir: Periodo == fin (fecha de cierre exacta) O Periodo dentro
+        # del rango [inicio, fin] (datos migrados con Periodo=Fecha de compra)
+        mask_rango.loc[mask_valida] = fechas[mask_valida].apply(
+            lambda d: d == fin or (inicio <= d <= fin)
+        )
     return gastos_df[mask_tarjeta & mask_rango].copy()
 
 # ── Estimación de cuotas futuras (NO oficial, ver aclaración en UI) ────────────
@@ -974,7 +1018,7 @@ if st.session_state.menu_accion:
                                    help="Si es en cuotas, poné el valor de UNA cuota (lo que pagás cada mes)")
             c3,c4 = st.columns(2)
             q_t = c3.selectbox("Tarjeta", TARJETAS)
-            q_k = c4.selectbox("Categoría", CAT_GASTOS)
+            q_k = c4.text_input("Categoría", placeholder="Ej: Comida, Perfume, Viaje...")
             c5,c6,c7 = st.columns(3)
             q_f = c5.date_input("Fecha de compra", value=date.today())
             q_cu_act = c6.number_input("Cuota actual", min_value=1, max_value=48, value=1)
@@ -988,7 +1032,10 @@ if st.session_state.menu_accion:
                     # actualiza esta misma fila al reimportar ese resumen).
                     # Periodo = hoy, porque esta carga corresponde al ciclo
                     # actual de la tarjeta.
-                    periodo_hoy = calcular_periodo_de_importacion(q_t, tarjetas_df)
+                    periodo_hoy = periodo_para_fila(
+                        fmt_fecha(q_f), fmt_cuotas(int(q_cu_act), int(q_cu_tot)),
+                        q_t, tarjetas_df
+                    )
                     nv = pd.DataFrame([{
                         "Fecha": fmt_fecha(q_f), "Concepto": q_c.strip(), "Monto": q_m,
                         "Tarjeta": q_t, "Cuotas": fmt_cuotas(int(q_cu_act), int(q_cu_tot)),
@@ -1446,6 +1493,22 @@ with tabs[1]:
                 key="download_backup"
             )
 
+    with st.expander("🗑️ Borrar TODOS los movimientos (reseteo total)"):
+        st.markdown(
+            "<div class='info-strip' style='background:#3a1a1a;border-color:#f87171'>"
+            "⚠️ <b>Esta acción borra todos los gastos de todas las tarjetas y no se puede deshacer.</b> "
+            "Descargá el backup antes de continuar."
+            "</div>", unsafe_allow_html=True
+        )
+        _confirm_reset = st.checkbox("Entiendo que esto borrará todos los movimientos de forma permanente")
+        if _confirm_reset:
+            if st.button("🗑️ Confirmar reseteo total", key="btn_reset_total"):
+                gastos_vacio = pd.DataFrame(columns=FILES["gastos"][1])
+                save("gastos", gastos_vacio)
+                load.clear()
+                st.success("✅ Todos los movimientos fueron borrados.")
+                st.rerun()
+
     with st.expander("✏️ Carga manual"):
         with st.form("f_gasto_full", clear_on_submit=True):
             g_c = st.text_input("Concepto", placeholder="Ej: almuerzo, nafta, cuota…")
@@ -1473,7 +1536,10 @@ with tabs[1]:
                     # (intacta, no se inventan fechas de otras cuotas) y
                     # Periodo = ciclo actual de la tarjeta (esta carga
                     # corresponde a lo que pagás ESTE mes).
-                    periodo_hoy = calcular_periodo_de_importacion(g_t, tarjetas_df)
+                    periodo_hoy = periodo_para_fila(
+                        fmt_fecha(g_f), fmt_cuotas(int(g_cu_act), int(g_cu_tot)),
+                        g_t, tarjetas_df
+                    )
                     nv = pd.DataFrame([{
                         "Fecha": fmt_fecha(g_f), "Concepto": g_c.strip(), "Monto": g_m,
                         "Tarjeta": g_t, "Cuotas": fmt_cuotas(int(g_cu_act), int(g_cu_tot)),
