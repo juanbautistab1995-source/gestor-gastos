@@ -449,7 +449,6 @@ def asegurar_columna_periodo():
     gastos_df["Monto"] = to_num(gastos_df["Monto"])
     gastos_df["Cuanto recupero"] = to_num(gastos_df["Cuanto recupero"])
     save("gastos", gastos_df)
-    load.clear()
 
 # ── Tarjetas y ciclos reales (FIX problema 2 — ver resumen del refactor) ───────
 def get_tarjetas_nombres(gastos_df, tarjetas_df):
@@ -637,31 +636,29 @@ def ciclo_por_offset_de_tarjeta(tarjeta_nombre, tarjetas_df, offset):
     return ultimo
 
 def filtrar_gastos_tarjeta_rango(gastos_df, tarjeta_nombre, inicio, fin):
-    """Filtra gastos de una tarjeta cuyo PERIODO cae dentro del rango [inicio, fin].
+    """Filtra gastos de una tarjeta cuyo PERIODO corresponde al ciclo dado.
     
-    El modelo de datos es:
-    - Fecha: siempre la fecha ORIGINAL de compra (nunca cambia)
-    - Periodo: el mes en que el banco te cobra esa fila. Para gastos simples
-      es el cierre del mes donde cayó la compra. Para cuotas intermedias es
-      el cierre del mes en que el banco factura ESA cuota específica.
+    Periodo es siempre la fecha de cierre del resumen bancario (ej: 2026-06-30).
+    El ciclo se define como [inicio+1, fin], donde fin es esa fecha de cierre.
     
-    Ejemplo: Arredo comprado el 13/04 aparece como:
-      Cuota 1/3, Periodo=30/04 → visible en el ciclo de abril
-      Cuota 2/3, Periodo=31/05 → visible en el ciclo de mayo  
-      Cuota 3/3, Periodo=30/06 → visible en el ciclo de junio
+    El filtro acepta dos casos:
+    1. Periodo == fin exacto (el caso normal: el resumen cerró en 'fin')
+    2. Periodo dentro de [inicio, fin] (compatibilidad con datos migrados)
     
-    Compatibilidad: si no hay columna Periodo, filtra por Fecha directamente."""
+    Esto resuelve el caso donde fin=2026-06-30 pero el ciclo calculado
+    empieza el 01/07 — el Periodo 2026-06-30 matchea por la condición 1."""
     if gastos_df.empty:
         return gastos_df.copy()
     mask_tarjeta = gastos_df["Tarjeta"].astype(str).str.strip() == tarjeta_nombre.strip()
-    # Usar Periodo si existe, sino Fecha (compatibilidad con datos viejos)
     columna = gastos_df["Periodo"] if "Periodo" in gastos_df.columns else gastos_df["Fecha"]
     fechas_dt = pd.to_datetime(columna, errors="coerce")
     fechas = fechas_dt.apply(lambda x: x.date() if pd.notna(x) else None)
     mask_valida = fechas.notna()
     mask_rango = pd.Series(False, index=gastos_df.index)
     if mask_valida.any():
-        mask_rango.loc[mask_valida] = fechas[mask_valida].apply(lambda d: inicio <= d <= fin)
+        mask_rango.loc[mask_valida] = fechas[mask_valida].apply(
+            lambda d: d == fin or (inicio <= d <= fin)
+        )
     return gastos_df[mask_tarjeta & mask_rango].copy()
 
 # ── Estimación de cuotas futuras (NO oficial, ver aclaración en UI) ────────────
@@ -1502,7 +1499,6 @@ with tabs[1]:
             if st.button("🗑️ Confirmar reseteo total", key="btn_reset_total"):
                 gastos_vacio = pd.DataFrame(columns=FILES["gastos"][1])
                 save("gastos", gastos_vacio)
-                load.clear()
                 st.success("✅ Todos los movimientos fueron borrados.")
                 st.rerun()
 
