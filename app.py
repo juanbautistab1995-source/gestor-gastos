@@ -370,18 +370,15 @@ def calcular_periodo_de_importacion(tarjeta_nombre, tarjetas_df):
     _, fin = ciclo_actual_de_tarjeta(tarjeta_nombre, tarjetas_df)
     return fin.strftime("%Y-%m-%d")
 
-def actualizar_o_crear_gastos(base_df, nuevos_df, periodo_str):
+def actualizar_o_crear_gastos(base_df, nuevos_df, periodo_str=None):
     """Para cada fila de nuevos_df (un resumen recién importado o pegado):
     - Si YA EXISTE una fila en base_df con el mismo (Concepto normalizado +
-      Fecha + Tarjeta normalizada): se actualiza SOLO su Cuotas y su Periodo
-      (la cuota avanzó de mes, ej "3/12" -> "6/12"). La Fecha original NUNCA
-      se toca — sigue siendo la fecha real de la compra.
-    - Si NO existe: es una compra nueva (cuota 1 o gasto sin cuotas) — se
-      agrega con Periodo = periodo_str.
+      Fecha + Tarjeta normalizada): se actualiza SOLO su Cuotas y Monto
+      (la cuota avanzó de mes, ej "3/12" -> "6/12"). La Fecha NUNCA se toca.
+    - Si NO existe: es una compra nueva — se agrega directamente.
+    Sin columna Periodo — el filtrado se hace siempre por Fecha vs rango.
     Devuelve (base_actualizada, cant_actualizadas, cant_nuevas)."""
     base = base_df.copy()
-    if "Periodo" not in base.columns:
-        base["Periodo"] = base["Fecha"]
     base["_clave"] = (
         base["Concepto"].apply(_normalizar_texto) + "|" +
         base["Fecha"].astype(str) + "|" +
@@ -399,11 +396,11 @@ def actualizar_o_crear_gastos(base_df, nuevos_df, periodo_str):
         if not match.empty:
             idx = match.index[0]
             base.loc[idx, "Cuotas"] = r.get("Cuotas", "1")
-            base.loc[idx, "Periodo"] = periodo_str
+            base.loc[idx, "Monto"] = r.get("Monto", base.loc[idx, "Monto"])
             cant_actualizadas += 1
         else:
             nueva = r.to_dict()
-            nueva["Periodo"] = periodo_str
+            nueva.pop("Periodo", None)
             nuevas_filas.append(nueva)
     base = base.drop(columns=["_clave"])
     if nuevas_filas:
@@ -411,7 +408,7 @@ def actualizar_o_crear_gastos(base_df, nuevos_df, periodo_str):
         for col in FILES["gastos"][1]:
             if col not in nuevas_df_final.columns:
                 nuevas_df_final[col] = ""
-        base = pd.concat([base, nuevas_df_final], ignore_index=True)
+        base = pd.concat([base, nuevas_df_final[FILES["gastos"][1]]], ignore_index=True)
     return base, cant_actualizadas, len(nuevas_filas)
 
 def eliminar_cuotas_modelo_viejo(gastos_df):
@@ -433,34 +430,26 @@ def eliminar_cuotas_modelo_viejo(gastos_df):
 _MIGRACION_FLAG_V2 = ".periodo_v2_activado"
 
 def asegurar_columna_periodo():
-    """Si el CSV de gastos no tiene la columna Periodo poblada (datos de
-    antes de este rediseño, o una corrida anterior de esta misma función
-    que no llegó a completarla — ej. por un crash a mitad de camino), la
-    completa igualando Periodo = Fecha para esas filas.
-    FIX: ya NO depende ciegamente de un flag en disco para decidir si
-    correr — antes, si el flag se creaba en una corrida que fallaba o
-    corría sobre una base vacía/parcial, la migración real NUNCA volvía a
-    intentarse, dejando filas con Periodo vacío para siempre (causa
-    confirmada de que Home y Tarjetas mostraran $0 en todas las tarjetas).
-    Ahora SIEMPRE revisa si hay filas con Periodo vacío y las completa,
-    sin importar el estado del flag — es idempotente y de bajo costo
-    (un load() + comparación de string vacío), así que no hace falta
-    saltarla por performance."""
+    """Migración: asegura que todos los gastos tengan Periodo poblado.
+    - Para filas sin Periodo: asigna la fecha de cierre del ciclo donde
+      cae la Fecha de compra (para gastos simples) o el ciclo actual
+      (para cuotas intermedias, que ya estaban siendo cobradas).
+    - Idempotente: solo actúa si hay filas con Periodo vacío."""
     gastos_df = load("gastos")
-    if gastos_df.empty or "Periodo" not in gastos_df.columns:
-        if not os.path.exists(_MIGRACION_FLAG_V2):
-            open(_MIGRACION_FLAG_V2, "w").close()
+    if gastos_df.empty:
         return
-    falta_periodo = gastos_df["Periodo"].astype(str).str.strip() == ""
-    if falta_periodo.any():
-        gastos_df.loc[falta_periodo, "Periodo"] = gastos_df.loc[falta_periodo, "Fecha"]
-        gastos_df["Monto"] = to_num(gastos_df["Monto"])
-        gastos_df["Cuanto recupero"] = to_num(gastos_df["Cuanto recupero"])
-        save("gastos", gastos_df)
-    if not os.path.exists(_MIGRACION_FLAG_V2):
-        open(_MIGRACION_FLAG_V2, "w").close()
-
-
+    if "Periodo" not in gastos_df.columns:
+        gastos_df["Periodo"] = ""
+    falta = gastos_df["Periodo"].astype(str).str.strip().isin(["", "nan", "NaT", "None"])
+    if not falta.any():
+        return
+    # Para migración simple: Periodo = Fecha (la fecha de compra)
+    # El usuario puede corregir manualmente o reimportando el resumen real
+    gastos_df.loc[falta, "Periodo"] = gastos_df.loc[falta, "Fecha"]
+    gastos_df["Monto"] = to_num(gastos_df["Monto"])
+    gastos_df["Cuanto recupero"] = to_num(gastos_df["Cuanto recupero"])
+    save("gastos", gastos_df)
+    load.clear()
 
 # ── Tarjetas y ciclos reales (FIX problema 2 — ver resumen del refactor) ───────
 def get_tarjetas_nombres(gastos_df, tarjetas_df):
@@ -648,31 +637,31 @@ def ciclo_por_offset_de_tarjeta(tarjeta_nombre, tarjetas_df, offset):
     return ultimo
 
 def filtrar_gastos_tarjeta_rango(gastos_df, tarjeta_nombre, inicio, fin):
-    """Filtra gastos de una tarjeta cuyo PERIODO corresponde al ciclo dado.
-    El campo Periodo siempre es la FECHA DE CIERRE del resumen al que
-    pertenece la fila (ej: 2026-06-30 para el resumen que cierra el 30/06).
-    Por eso el filtro correcto es Periodo == fin (fecha de cierre del ciclo),
-    NO inicio <= Periodo <= fin — con ese último criterio, una fecha como
-    2026-06-30 quedaría fuera del ciclo siguiente 01/07→02/08, aunque
-    conceptualmente sí pertenece al resumen de ese cierre.
-    También acepta gastos cuyo Periodo caiga dentro del rango [inicio, fin]
-    para compatibilidad con datos migrados con Periodo=Fecha (que puede ser
-    cualquier fecha de compra dentro del ciclo)."""
+    """Filtra gastos de una tarjeta cuyo PERIODO cae dentro del rango [inicio, fin].
+    
+    El modelo de datos es:
+    - Fecha: siempre la fecha ORIGINAL de compra (nunca cambia)
+    - Periodo: el mes en que el banco te cobra esa fila. Para gastos simples
+      es el cierre del mes donde cayó la compra. Para cuotas intermedias es
+      el cierre del mes en que el banco factura ESA cuota específica.
+    
+    Ejemplo: Arredo comprado el 13/04 aparece como:
+      Cuota 1/3, Periodo=30/04 → visible en el ciclo de abril
+      Cuota 2/3, Periodo=31/05 → visible en el ciclo de mayo  
+      Cuota 3/3, Periodo=30/06 → visible en el ciclo de junio
+    
+    Compatibilidad: si no hay columna Periodo, filtra por Fecha directamente."""
     if gastos_df.empty:
         return gastos_df.copy()
     mask_tarjeta = gastos_df["Tarjeta"].astype(str).str.strip() == tarjeta_nombre.strip()
-    columna_periodo = gastos_df["Periodo"] if "Periodo" in gastos_df.columns else gastos_df["Fecha"]
-    fechas_dt = pd.to_datetime(columna_periodo, errors="coerce")
-    # FIX pandas reciente: .dt.date puede no convertir si todo es NaT
+    # Usar Periodo si existe, sino Fecha (compatibilidad con datos viejos)
+    columna = gastos_df["Periodo"] if "Periodo" in gastos_df.columns else gastos_df["Fecha"]
+    fechas_dt = pd.to_datetime(columna, errors="coerce")
     fechas = fechas_dt.apply(lambda x: x.date() if pd.notna(x) else None)
     mask_valida = fechas.notna()
     mask_rango = pd.Series(False, index=gastos_df.index)
     if mask_valida.any():
-        # Incluir: Periodo == fin (fecha de cierre exacta) O Periodo dentro
-        # del rango [inicio, fin] (datos migrados con Periodo=Fecha de compra)
-        mask_rango.loc[mask_valida] = fechas[mask_valida].apply(
-            lambda d: d == fin or (inicio <= d <= fin)
-        )
+        mask_rango.loc[mask_valida] = fechas[mask_valida].apply(lambda d: inicio <= d <= fin)
     return gastos_df[mask_tarjeta & mask_rango].copy()
 
 # ── Estimación de cuotas futuras (NO oficial, ver aclaración en UI) ────────────
@@ -1040,7 +1029,7 @@ if st.session_state.menu_accion:
                         "Fecha": fmt_fecha(q_f), "Concepto": q_c.strip(), "Monto": q_m,
                         "Tarjeta": q_t, "Cuotas": fmt_cuotas(int(q_cu_act), int(q_cu_tot)),
                         "Categoria": q_k, "Compartido": "No", "Con quien": "",
-                        "Cuanto recupero": 0, "Notas": "", "Periodo": periodo_hoy,
+                        "Cuanto recupero": 0, "Notas": "", "Periodo": periodo_para_fila(fmt_fecha(q_f), fmt_cuotas(int(q_cu_act),int(q_cu_tot)), q_t, tarjetas_df),
                     }])
                     gastos_df = pd.concat([gastos_df, nv], ignore_index=True)
                     gastos_df = sort_by_fecha(gastos_df)
@@ -1341,8 +1330,6 @@ with tabs[1]:
                     # nuevo, probablemente se pegó el mismo resumen dos veces).
                     gastos_actuales = load("gastos")
                     gastos_actuales["Monto"] = to_num(gastos_actuales["Monto"])
-                    if "Periodo" not in gastos_actuales.columns:
-                        gastos_actuales["Periodo"] = gastos_actuales["Fecha"]
 
                     clave_existente = (
                         gastos_actuales["Concepto"].apply(_normalizar_texto) + "|" +
@@ -1448,24 +1435,34 @@ with tabs[1]:
                     if "Periodo" not in base.columns:
                         base["Periodo"] = base["Fecha"]
 
-                    # Determinar el Periodo de esta importación: el ciclo
-                    # actual de la tarjeta elegida (todas las filas de un
-                    # mismo resumen pertenecen al mismo ciclo).
-                    periodo_import = calcular_periodo_de_importacion(tarjeta_import, tarjetas_df)
+                    # Periodo de cada fila: si el CSV lo trae, se respeta.
+                    # Si no, se usa el ciclo actual de la tarjeta (el resumen
+                    # que estás importando ahora es el del ciclo actual).
+                    periodo_import_default = calcular_periodo_de_importacion(tarjeta_import, tarjetas_df)
 
-                    # Aplicar actualizaciones (cuota avanzó): se modifica la
-                    # fila existente in-place, Fecha NUNCA se toca.
+                    def _get_periodo_import(r):
+                        p = str(r.get("Periodo", "")).strip()
+                        if p and p not in ("nan", "NaT", "None", ""):
+                            return p
+                        return periodo_import_default
+
+                    # Aplicar actualizaciones (cuota avanzó): Fecha NUNCA cambia
                     for _, r in df_actualizacion.iterrows():
                         idx_e = int(r["_idx_existente"])
                         if idx_e in base.index:
                             base.loc[idx_e, "Cuotas"] = r["Cuotas"]
-                            base.loc[idx_e, "Periodo"] = periodo_import
-                            base.loc[idx_e, "Monto"] = r["Monto"]  # por si el monto varió (ajuste del banco)
+                            base.loc[idx_e, "Periodo"] = _get_periodo_import(r)
+                            base.loc[idx_e, "Monto"] = r["Monto"]
 
-                    # Agregar filas nuevas, con Periodo = ciclo actual
+                    # Agregar filas nuevas con su Periodo
                     if not df_nuevas.empty:
                         df_nuevas_final = df_nuevas.copy()
-                        df_nuevas_final["Periodo"] = periodo_import
+                        df_nuevas_final["Periodo"] = df_nuevas_final.apply(_get_periodo_import, axis=1)
+                        for col in FILES["gastos"][1]:
+                            if col not in df_nuevas_final.columns:
+                                df_nuevas_final[col] = ""
+                        df_nuevas_final = df_nuevas_final[FILES["gastos"][1]]
+                        df_nuevas_final = df_nuevas_final[FILES["gastos"][1]]
                         base = pd.concat([base, df_nuevas_final], ignore_index=True)
 
                     base = sort_by_fecha(base)
@@ -1544,7 +1541,7 @@ with tabs[1]:
                         "Fecha": fmt_fecha(g_f), "Concepto": g_c.strip(), "Monto": g_m,
                         "Tarjeta": g_t, "Cuotas": fmt_cuotas(int(g_cu_act), int(g_cu_tot)),
                         "Categoria": g_k, "Compartido": g_comp, "Con quien": g_quien.strip(),
-                        "Cuanto recupero": g_rec, "Notas": g_nota, "Periodo": periodo_hoy,
+                        "Cuanto recupero": g_rec, "Notas": g_nota, "Periodo": periodo_para_fila(fmt_fecha(g_f), fmt_cuotas(int(g_cu_act),int(g_cu_tot)), g_t, tarjetas_df),
                     }])
                     gastos_df = pd.concat([gastos_df, nv], ignore_index=True)
                     gastos_df = sort_by_fecha(gastos_df)
@@ -1922,7 +1919,7 @@ with tabs[2]:
             df_ed["Cuota total"]  = _cuotas_parseadas.apply(lambda t: t[1])
             df_ed = df_ed.drop(columns=["Cuotas"])
             df_ed["Cuanto recupero"] = pd.to_numeric(df_ed["Cuanto recupero"], errors="coerce").fillna(0)
-            df_ed["Periodo"] = df_per["Periodo"].values if "Periodo" in df_per.columns else df_ed["Fecha"]
+            df_ed["Periodo"] = df_per["Periodo"].values if "Periodo" in df_per.columns else df_per["Fecha"].values
             for c in ["Concepto","Tarjeta","Categoria","Compartido","Con quien","Notas"]:
                 df_ed[c] = df_ed[c].fillna("").astype(str)
             st.session_state[_key_periodo] = df_ed
@@ -1997,17 +1994,14 @@ with tabs[2]:
             base["Monto"]           = to_num(base["Monto"])
             base["Cuanto recupero"] = to_num(base["Cuanto recupero"])
 
-            # NUEVO MECANISMO: en vez de rastrear row_ids numéricos (que se
-            # desincronizaban cuando base cambiaba de tamaño entre la primera
-            # carga y el guardado), identificamos las filas del período por
-            # CLAVE DE CONTENIDO: Concepto+Fecha+Tarjeta+Periodo.
-            # Esto es robusto porque no depende de posiciones en el DataFrame.
+            # MECANISMO: identificamos las filas del período por CLAVE DE
+            # CONTENIDO: Concepto+Fecha+Tarjeta. Robusto — no depende de
+            # posiciones en el DataFrame que pueden desincronizarse.
             def _clave_fila(r):
                 return (
                     str(r.get("Concepto","")).strip(),
                     str(r.get("Fecha",""))[:10],
                     str(r.get("Tarjeta","")).strip(),
-                    str(r.get("Periodo",""))[:10],
                 )
             # Las claves que pertenecen a este período son las de df_ed
             # (la copia estable que cargamos al inicio de esta vista).
@@ -2024,41 +2018,18 @@ with tabs[2]:
             nuevas["Cuotas"] = [fmt_cuotas(a, t) for a, t in zip(_cuota_act_col, _cuota_tot_col)]
             nuevas = nuevas.drop(columns=["Cuota actual", "Cuota total"], errors="ignore")
 
-            # FIX: preservar "Periodo" de las filas que YA existían. Según la
-            # documentación oficial de Streamlit, st.data_editor "no soporta
-            # reordenar filas, así que las filas agregadas siempre se
-            # appendean al final del dataframe, con las ediciones y borrados
-            # aplicados sobre las filas originales" — es decir, las primeras
-            # N filas de `edited_per` (N = filas que YA existían en df_ed,
-            # menos las borradas) preservan su posición relativa original.
-            # Esto permite mapear Periodo por posición simple, sin reconstruir
-            # nada a mano: se toma el Periodo de las primeras `cant_previas`
-            # filas según df_ed (filtrando las que el usuario borró, detectadas
-            # por comparar cuántas hay ahora vs antes), y el resto (filas
-            # nuevas agregadas al final) recibe el Periodo del período actual.
-            periodo_de_esta_vista = fin_p.strftime("%Y-%m-%d")
-            cant_originales = len(df_ed)
-            cant_actuales_no_nuevas = min(len(nuevas), cant_originales)
-            # Si se borraron filas, len(nuevas) puede ser menor a cant_originales
-            # sin que haya filas nuevas agregadas — en ese caso, todas las
-            # filas restantes son "viejas" y conservan su Periodo según su
-            # posición entre las que quedaron. Para evitar mapear mal una fila
-            # vieja con el Periodo de otra, se usa el criterio más simple y
-            # robusto: si NO hubo altas nuevas (len(nuevas) <= cant_originales),
-            # todas las filas restantes son viejas; el Periodo correcto de
-            # CADA una se busca por Concepto+Fecha+Monto contra df_ed, no por
-            # posición — más confiable cuando hubo borrados intermedios.
-            periodos_por_clave = {}
+            # Preservar Periodo de las filas existentes por clave Concepto+Fecha+Monto
+            _periodo_por_clave = {}
             if "Periodo" in df_ed.columns:
                 for _, _r in df_ed.iterrows():
-                    _clave = (str(_r["Concepto"]).strip(), str(_r["Fecha"]), round(float(_r["Monto"]), 2))
-                    periodos_por_clave[_clave] = _r["Periodo"]
-            _periodos_nuevas = []
+                    _k = (str(_r["Concepto"]).strip(), str(_r["Fecha"]), round(float(_r["Monto"]),2))
+                    _periodo_por_clave[_k] = str(_r["Periodo"])
+            _periodo_default = calcular_periodo_de_importacion(t_sel, tarjetas_df)
+            _periodos = []
             for _, _r in nuevas.iterrows():
-                _clave = (str(_r["Concepto"]).strip(), str(_r["Fecha"]), round(float(_r["Monto"]), 2))
-                _periodos_nuevas.append(periodos_por_clave.get(_clave, periodo_de_esta_vista))
-            nuevas["Periodo"] = _periodos_nuevas
-
+                _k = (str(_r["Concepto"]).strip(), str(_r["Fecha"]), round(float(_r["Monto"]),2))
+                _periodos.append(_periodo_por_clave.get(_k, _periodo_default))
+            nuevas["Periodo"] = _periodos
             for col in FILES["gastos"][1]:
                 if col not in nuevas.columns:
                     nuevas[col] = ""
