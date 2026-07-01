@@ -635,37 +635,18 @@ def ciclo_por_offset_de_tarjeta(tarjeta_nombre, tarjetas_df, offset):
     return ultimo
 
 def filtrar_gastos_tarjeta_rango(gastos_df, tarjeta_nombre, inicio, fin):
-    """Filtra gastos cuyo Periodo pertenece al ciclo [inicio, fin].
-    
-    Un gasto pertenece a este ciclo si su Periodo (fecha de cierre del
-    resumen bancario) está dentro del MISMO MES CALENDARIO que fin.
-    Esto resuelve el caso donde fin=02/07 pero Periodo=30/06: ambos
-    son del mismo "mes de resumen" (junio/julio son meses distintos,
-    pero el banco te los cobra en el mismo vencimiento).
-    
-    Criterio exacto: Periodo cae en [inicio, fin] O Periodo cae en el
-    mes de fin (mismo año+mes que fin). Sin Periodo, usa Fecha."""
+    """Filtra gastos por FECHA del movimiento dentro del rango [inicio, fin].
+    Ignora la columna Periodo — la Fecha de compra determina en qué ciclo
+    aparece el gasto, igual que en el resumen real del banco."""
     if gastos_df.empty:
         return gastos_df.copy()
     mask_tarjeta = gastos_df["Tarjeta"].astype(str).str.strip() == tarjeta_nombre.strip()
-    columna = gastos_df["Periodo"] if "Periodo" in gastos_df.columns else gastos_df["Fecha"]
-    fechas_dt = pd.to_datetime(columna, errors="coerce")
+    fechas_dt = pd.to_datetime(gastos_df["Fecha"], errors="coerce")
     fechas = fechas_dt.apply(lambda x: x.date() if pd.notna(x) else None)
     mask_valida = fechas.notna()
     mask_rango = pd.Series(False, index=gastos_df.index)
     if mask_valida.any():
-        # El ciclo "de julio" va de 29/06 a 28/07 para Hipotecario.
-        # Un Periodo=30/06 pertenece al ciclo anterior (junio), no a julio.
-        # Un Periodo=28/07 pertenece a este ciclo (julio).
-        # Criterio: Periodo dentro de [inicio, fin] exacto.
-        # Para que Periodo=30/06 matchee el ciclo 29/05→30/06 y NO el 01/07→02/08:
-        # inicio del ciclo de junio = 29/05, fin = 30/06.
-        # 29/05 <= 30/06 <= 30/06 ✓
-        # inicio del ciclo de julio = 01/07, fin = 02/08.
-        # 01/07 <= 30/06 ≤ 02/08 → FALSE ✓
-        mask_rango.loc[mask_valida] = fechas[mask_valida].apply(
-            lambda d: inicio <= d <= fin
-        )
+        mask_rango.loc[mask_valida] = fechas[mask_valida].apply(lambda d: inicio <= d <= fin)
     return gastos_df[mask_tarjeta & mask_rango].copy()
 
 # ── Estimación de cuotas futuras (NO oficial, ver aclaración en UI) ────────────
