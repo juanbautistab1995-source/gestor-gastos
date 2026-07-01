@@ -982,8 +982,13 @@ gastos_df = sort_by_fecha(gastos_df)
 # diciendo el actual).
 _tarjeta_principal_home = get_tarjeta_principal(gastos_df, tarjetas_df)
 _ini_home, _fin_home = ciclo_actual_de_tarjeta(_tarjeta_principal_home, tarjetas_df)
-y, m = _fin_home.year, _fin_home.month
-nombre_mes = calendar.month_name[m].capitalize()
+# Usar el mes de RESUMEN (ajustado para cierres a comienzos de mes), no el
+# mes calendario de la fecha de cierre — así el encabezado coincide con lo
+# que el usuario piensa como "este mes".
+_nombre_mes_pp, _año_pp = nombre_mes_de_ciclo(_fin_home)
+m = list(calendar.month_name).index(_nombre_mes_pp)
+y = _año_pp
+nombre_mes = _nombre_mes_pp
 
 # IMPORTANTE: gastos_mes filtra por "Periodo" (ciclo de tarjeta), NO por
 # "Fecha" (fecha real de compra) — mismo motivo que en Tarjetas y
@@ -1188,20 +1193,11 @@ with tabs[0]:
             _gastos_periodo_home.append(_gf)
     gastos_periodo_home = pd.concat(_gastos_periodo_home, ignore_index=True) if _gastos_periodo_home else gastos_df.iloc[0:0]
 
-    # Ingresos del período: usar el ciclo de la tarjeta principal para ese mes
-    _ciclo_pp_mes = ciclo_de_tarjeta_para_mes(_tarjeta_principal_home, tarjetas_df, _mes_sel, _año_sel)
-    if _ciclo_pp_mes is not None:
-        _ini_principal, _fin_principal = _ciclo_pp_mes
-    else:
-        _ini_principal = date(_año_sel, _mes_sel, 1)
-        _fin_principal = date(_año_sel, _mes_sel, calendar.monthrange(_año_sel, _mes_sel)[1])
+    # Ingresos del período: se agrupan por MES CALENDARIO (no por ciclo de
+    # tarjeta) — un ingreso es plata que entra, no depende del cierre de
+    # ninguna tarjeta. El mes seleccionado en Home define qué ingresos entran.
     if not ingresos_df.empty:
-        _fechas_ing = pd.to_datetime(ingresos_df["Fecha"], errors="coerce").apply(lambda x: x.date() if pd.notna(x) else None)
-        _mask_ing_valida = _fechas_ing.notna()
-        _mask_ing_rango = pd.Series(False, index=ingresos_df.index)
-        if _mask_ing_valida.any():
-            _mask_ing_rango.loc[_mask_ing_valida] = _fechas_ing[_mask_ing_valida].apply(lambda d: _ini_principal <= d <= _fin_principal)
-        ingresos_periodo_home = ingresos_df[_mask_ing_rango]
+        ingresos_periodo_home = ingresos_df[pd.to_datetime(ingresos_df["Fecha"], errors="coerce").dt.to_period("M") == pd.Period(year=_año_sel, month=_mes_sel, freq="M")]
     else:
         ingresos_periodo_home = ingresos_df
 
@@ -2205,8 +2201,49 @@ with tabs[3]:
             else:
                 st.warning("Completá concepto y monto.")
 
-    st.markdown(f"<div class='sec'>{nombre_mes} {y}</div>", unsafe_allow_html=True)
-    ing_show = ingresos_mes.sort_values("Fecha", ascending=False) if not ingresos_mes.empty else ingresos_mes
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+
+    # Navegación por mes calendario, igual que Inicio. Arranca en el mes
+    # actual del sistema. El usuario puede ir a meses anteriores/posteriores.
+    if "_ing_mes" not in st.session_state:
+        _hoy_ing = date.today()
+        st.session_state["_ing_mes"] = _hoy_ing.month
+        st.session_state["_ing_año"] = _hoy_ing.year
+
+    _ci_prev, _ci_label, _ci_next = st.columns([1, 3, 1])
+    with _ci_prev:
+        if st.button("◀", key="ing_mes_prev"):
+            _m = st.session_state["_ing_mes"] - 1
+            _a = st.session_state["_ing_año"]
+            if _m == 0:
+                _m = 12; _a -= 1
+            st.session_state["_ing_mes"] = _m
+            st.session_state["_ing_año"] = _a
+            st.rerun()
+    with _ci_next:
+        if st.button("▶", key="ing_mes_next"):
+            _m = st.session_state["_ing_mes"] + 1
+            _a = st.session_state["_ing_año"]
+            if _m == 13:
+                _m = 1; _a += 1
+            st.session_state["_ing_mes"] = _m
+            st.session_state["_ing_año"] = _a
+            st.rerun()
+
+    _ing_mes_sel = st.session_state["_ing_mes"]
+    _ing_año_sel = st.session_state["_ing_año"]
+    _ing_nombre_mes = calendar.month_name[_ing_mes_sel].capitalize()
+    with _ci_label:
+        st.markdown(
+            f"<div style='text-align:center;font-size:0.78rem;color:#888;padding-top:0.4rem'>{_ing_nombre_mes} {_ing_año_sel}</div>",
+            unsafe_allow_html=True
+        )
+
+    # Filtrar ingresos del mes seleccionado (por mes calendario de la Fecha)
+    _ingresos_mes_nav = ingresos_df[pd.to_datetime(ingresos_df["Fecha"], errors="coerce").dt.to_period("M") == pd.Period(year=_ing_año_sel, month=_ing_mes_sel, freq="M")] if not ingresos_df.empty else ingresos_df
+
+    st.markdown(f"<div class='sec'>{_ing_nombre_mes} {_ing_año_sel}</div>", unsafe_allow_html=True)
+    ing_show = _ingresos_mes_nav.sort_values("Fecha", ascending=False) if not _ingresos_mes_nav.empty else _ingresos_mes_nav
     if ing_show.empty:
         st.markdown("<div class='empty'><big>💰</big>Sin ingresos este mes.</div>", unsafe_allow_html=True)
     else:
