@@ -1439,11 +1439,16 @@ with tabs[1]:
             if df_nuevas.empty and df_actualizacion.empty:
                 st.markdown("<div class='empty'><big>✅</big>Nada nuevo para importar.</div>", unsafe_allow_html=True)
             else:
+                # Recargar gastos actuales para mostrar la cuota vieja en el
+                # preview — este bloque corre en cada rerun, no solo cuando se
+                # apretó "Previsualizar", así que gastos_actuales puede no
+                # estar definida en este scope.
+                _gastos_para_preview = load("gastos")
                 if not df_actualizacion.empty:
                     st.caption(f"🔄 {len(df_actualizacion)} cuota(s) que AVANZAN de número (misma compra, mismo concepto+fecha):")
                     for _, r in df_actualizacion.head(20).iterrows():
                         idx_e = int(r["_idx_existente"])
-                        cuota_vieja = gastos_actuales.loc[idx_e, "Cuotas"] if idx_e in gastos_actuales.index else "?"
+                        cuota_vieja = _gastos_para_preview.loc[idx_e, "Cuotas"] if idx_e in _gastos_para_preview.index else "?"
                         st.markdown(
                             "<div class='tx'>"
                             f"<div class='tx-ico'>{emoji_cat(str(r.get('Categoria','💳')))}</div>"
